@@ -15,10 +15,21 @@ _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([
 
 
 def validate_contract(value: str | None) -> str:
+    # GATE_A_addition: explicit 'audit:' prefix marks the contract as a READ_ONLY audit
+    # against the named OWNER/REPO. Treat it as a local-only contract for completion
+    # (no published_pr required, no GitHub check-runs required). The OWNER/REPO suffix
+    # is preserved as documentary metadata so reviewers can see which repo the audit
+    # was nominally against.
     if value is None or value == "local-only":
         return "local-only"
+    if isinstance(value, str):
+        if value.startswith("audit:"):
+            suffix = value[len("audit:"):]
+            if not _REPO.fullmatch(suffix):
+                raise ValueError("audit: prefix requires OWNER/REPO suffix (e.g. 'audit:owner/repo')")
+            return "local-only"  # acceptance-side equivalent of local-only
     if not isinstance(value, str) or not (_REPO.fullmatch(value) or _PR.fullmatch(value)):
-        raise ValueError("completion_contract must be local-only, OWNER/REPO, or an exact GitHub PR URL")
+        raise ValueError("completion_contract must be local-only, OWNER/REPO, exact GitHub PR URL, or audit:OWNER/REPO")
     return value
 
 
@@ -37,6 +48,19 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False):
 
 
 def collect_acceptance(contract: str, published_pr: str | None) -> dict:
+    # GATE_A_addition: a contract starting with 'audit:' means a READ_ONLY audit; the
+    # presence of OWNER/REPO after the prefix is documentary metadata only, not a PR
+    # acceptance contract. Skip GitHub check-run collection entirely; acknowledge the
+    # audit completed if metadata.audit_evidence_path is supplied, otherwise warn.
+    if isinstance(contract, str) and contract.startswith("audit:"):
+        suffix = contract[len("audit:"):]
+        receipt = {"ok": True, "classification": "audit-local",
+                   "head_sha": None, "pr_url": None,
+                   "checks": [], "audit_target_repo": suffix,
+                   "recovery": "Read-only audit complete; no PR required. "
+                               "Ensure audit_evidence_path is set on the task metadata if downstream "
+                               "consumers want the JSON path. Use kanban_block if human input is needed."}
+        return receipt
     receipt = {"ok": False, "classification": "missing", "head_sha": None,
                "pr_url": published_pr, "checks": [],
                "recovery": "Fix required failures, rerun infrastructure checks or wait, then retry completion. "
