@@ -7,12 +7,14 @@ subprocesses and child Python ``print()`` calls agree on encoding.
 
 from __future__ import annotations
 
+import codecs
 import os
 import sys
 
-__all__ = ["configure_windows_stdio", "is_windows"]
+__all__ = ["configure_windows_stdio", "is_windows", "_install_safe_default_decoder"]
 
 _CONFIGURED = False
+_CODEC_WRAP_INSTALLED = False
 
 
 def is_windows() -> bool:
@@ -44,16 +46,54 @@ def _reconfigure_stream(stream, *, encoding: str = "utf-8", errors: str = "repla
         pass
 
 
-def configure_windows_stdio() -> bool:
+def _install_safe_default_decoder() -> None:
+    """Root-cause fix for ``subprocess._readerthread`` cp1252 UnicodeDecodeError on Windows.
+
+    ``subprocess.Popen(..., text=True)`` opens the child pipe with ``locale.getpreferredencoding``
+    (cp1252 here). The pipe's background reader thread calls ``codecs.decode(input, encoding)``
+    with no ``errors=`` arg, so any byte that cp1252 can't represent (0x80-0x9F: em-dash, curly
+    quotes, ...) raises ``UnicodeDecodeError`` and kills the reader thread. Wrapping
+    ``codecs.decode`` to default ``errors="replace"`` neutralises that without changing the
+    encoding; the bytes become ``?`` instead of crashing the thread.
+
+    Idempotent; re-running is a no-op.
+    """
+    global _CODEC_WRAP_INSTALLED
+    if _CODEC_WRAP_INSTALLED:
+        return
+    try:
+        original_decode = codecs.decode
+
+        def _safe_decode(data, encoding=None, *args, **kwargs):
+            # Only patch the errors= default; leave encoding choice to the caller. ``text=True``
+            # Popen passes ``encoding=cp1252, errors=None`` — the None triggers the strict default
+            # that throws on 0x90. Replace None with "replace".
+            if "errors" not in kwargs and args == ():
+                kwargs["errors"] = "replace"
+            return original_decode(data, encoding, *args, **kwargs)
+
+        # Defensive: only patch when the original has the signature we expect. ``codecs.decode``'s
+        # actual signature is decode(obj, encoding='utf-8', errors='strict').
+        if getattr(original_decode, "__module__", "") == codecs.__name__:
+            codecs.decode = _safe_decode
+            _CODEC_WRAP_INSTALLED = True
+    except Exception:
+        # Defensive: any failure here must never break the import.
+        pass
+
+
+def configure_windows_stdio(force: bool = False) -> bool:
     """Force UTF-8 stdio on Windows. No-op elsewhere.
 
     Idempotent; returns ``True`` only when something actually changed. Set
     ``HERMES_DISABLE_WINDOWS_UTF8=1`` to opt out (forces the old cp1252 path for diagnosing
-    encoding bugs). Also sets a default ``EDITOR`` on Windows if none is set.
+    encoding bugs). Set ``force=True`` to re-apply even after the first successful call (used by
+    long-lived daemons that imported us before sitecustomize had a chance to run). Also sets a
+    default ``EDITOR`` on Windows if none is set.
     """
     global _CONFIGURED
 
-    if _CONFIGURED:
+    if _CONFIGURED and not force:
         return False
     if not is_windows() or os.environ.get("HERMES_DISABLE_WINDOWS_UTF8") in {"1", "true", "True", "yes"}:
         _CONFIGURED = True  # repeated calls on POSIX / opted-out are true no-ops
@@ -78,6 +118,9 @@ def configure_windows_stdio() -> bool:
     # interpreter. stdin is included for batch/pipe input (prompt_toolkit manages its own encoding).
     for stream in (sys.stdout, sys.stderr, sys.stdin):
         _reconfigure_stream(stream)
+    # ROOT-CAUSE FIX: neutralise cp1252's strict-mode decoder so subprocess._readerthread can no
+    # longer crash on 0x90/0x9d bytes. Safe no-op if already installed.
+    _install_safe_default_decoder()
     _CONFIGURED = True
     return True
 
