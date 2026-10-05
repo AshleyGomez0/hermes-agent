@@ -354,3 +354,52 @@ def test_disabled_existing_429_requeue_is_failure_neutral(board, monkeypatch):
         assert not (home / 'kanban' / 'provider_capacity.sqlite').exists()
     finally:
         dispatch._recent_worker_exits.pop(987654, None)
+
+
+def test_unlisted_task_must_not_be_auto_assigned(board, monkeypatch):
+    conn, home, tmp_path = board
+    policy(board, monkeypatch)
+    task = card(conn)
+    with kb.write_txn(conn):
+        conn.execute('UPDATE tasks SET assignee=NULL WHERE id=?', (task,))
+    result = dispatch.dispatch_once(conn, spawn_fn=lambda *args: None, default_assignee='codex-worker')
+    actual = conn.execute('SELECT assignee,status FROM tasks WHERE id=?', (task,)).fetchone()
+    print('UNLISTED_RESULT', tuple(actual), 'auto_assigned_default', result.auto_assigned_default)
+    assert actual['assignee'] is None, 'Enabled Factory policy mutated an unlisted task assignment'
+
+
+def test_no_second_probe_while_first_worker_still_running(board, monkeypatch):
+    conn, home, tmp_path = board
+    a, b = card(conn), card(conn)
+    policy(board, monkeypatch, task_roles={a:'writer', b:'writer'})
+    monkeypatch.setattr(dispatch, 'check_respawn_guard', lambda *a, **k: None)
+    monkeypatch.setattr(dispatch, '_worker_alive', lambda *a, **k: True)
+    from hermes_cli.provider_capacity import CapacityBreaker
+    import os
+    breaker = CapacityBreaker(tmp_path / 'capacity.sqlite', enabled=True)
+    owner = os.path.normcase(str(home.resolve()))
+    now = dispatch.time.time()
+    assert breaker.rate_limited(owner, 'openai-codex', now=now-301)
+    calls = []
+    first = dispatch.dispatch_once(conn, spawn_fn=lambda task, workspace: calls.append(task.id) or 987654)
+    assert len(calls) == 1
+    first_task = calls[0]
+    monkeypatch.setattr(dispatch.time, 'time', lambda: now+61)
+    second = dispatch.dispatch_once(conn, spawn_fn=lambda task, workspace: calls.append(task.id) or 987655)
+    running = conn.execute("SELECT id,worker_pid FROM tasks WHERE status='running'").fetchall()
+    print('PROBE_RESULT', 'calls', calls, 'running', [tuple(r) for r in running])
+    assert len(calls) == 1, 'Lease expiry admitted another probe despite first worker remaining alive'
+
+
+def test_review_lane_cannot_dispatch_writer_contract(board, monkeypatch):
+    conn, home, tmp_path = board
+    task = card(conn)
+    policy(board, monkeypatch, task_roles={task:'writer'})
+    monkeypatch.setattr(dispatch, 'review_dispatch_enabled', lambda: True)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (task,))
+    result, calls = tick(conn)
+    print('REVIEW_WRITER_RESULT', calls)
+    assert calls == [], 'require_independent_reviewer accepted a writer contract for review lane'
+
+

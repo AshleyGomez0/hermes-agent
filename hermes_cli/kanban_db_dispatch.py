@@ -2131,6 +2131,9 @@ def _factory_policy_guard(conn: sqlite3.Connection, task_id: str, context=None) 
             sha = contract.get('reviewed_sha')
             if not isinstance(writer, str) or not writer.strip() or writer == task_id or not isinstance(sha, str) or re.fullmatch(r'[0-9a-fA-F]{40}', sha) is None:
                 return 'factory_invalid_review_contract'
+        phase = conn.execute('SELECT status FROM tasks WHERE id=?', (task_id,)).fetchone()
+        if phase is not None and phase['status'] == 'review' and role != 'independent_reviewer':
+            return 'factory_invalid_review_contract'
         row = conn.execute('SELECT provider_override, model_override, assignee FROM tasks WHERE id=?', (task_id,)).fetchone()
         route = next((r for r in eligible if row is not None and tuple(row) == (r['provider'], r['model'], r['profile']) and role in r['eligible_roles']), None)
         if route is None:
@@ -2142,6 +2145,27 @@ def _factory_policy_guard(conn: sqlite3.Connection, task_id: str, context=None) 
     except (OSError, ValueError, TypeError, AttributeError, sqlite3.Error) as exc:
         _kb._log.warning("kanban: explicit Factory routing policy invalid (%s); dispatch deferred", exc)
         return "factory_policy_invalid"
+
+
+def _factory_probe_alive(board_db, run_id):
+    """Read the bound run, including foreign-board workers; unknown is fail-closed.
+
+    A run without a PID is a pending spawn until its claim expires. Terminal
+    runs still carrying a live PID remain fenced until their worker exits.
+    """
+    try:
+        with sqlite3.connect(Path(board_db).resolve().as_uri() + '?mode=ro', uri=True, timeout=5) as board_conn:
+            row = board_conn.execute('SELECT worker_pid,worker_started_at,ended_at,claim_expires FROM task_runs WHERE id=?', (run_id,)).fetchone()
+        if row is None:
+            return None
+        pid, fingerprint, ended_at, expires = row
+        if pid:
+            return _worker_alive(pid, fingerprint)
+        if ended_at is not None:
+            return False
+        return not (expires is not None and time.time() >= expires)
+    except (sqlite3.Error, ValueError, OSError):
+        return None
 
 
 def _dispatch_lane_task(
@@ -2223,7 +2247,7 @@ def _dispatch_lane_task(
     if factory_context:
         from hermes_cli.provider_capacity import CapacityBreaker
         permit = CapacityBreaker(factory_context['ledger'], enabled=True).acquire(
-            factory_context['owner'], factory_context['provider'], now=time.time())
+            factory_context['owner'], factory_context['provider'], now=time.time(), probe_alive=_factory_probe_alive)
         if not permit.allowed:
             result.respawn_guarded.append((task_id, 'factory_capacity_' + permit.state.lower()))
             return False
@@ -2239,6 +2263,13 @@ def _dispatch_lane_task(
             conn.execute('UPDATE task_runs SET metadata=? WHERE id=?', (_kb._json_or_null({'factory_capacity': factory_context}), run_id))
             # Terminal helpers replace metadata; retain permit as a run-keyed event.
             _kb._append_event(conn, task_id, 'factory_capacity_permit', factory_context, run_id=run_id)
+        if factory_context.get('probe_token') and not CapacityBreaker(factory_context['ledger'], enabled=True).bind_probe(
+                factory_context['owner'], factory_context['provider'], factory_context['probe_token'],
+                board=factory_context['board'], run_id=str(run_id), now=time.time()):
+            # No spawn without a durable run fence. Existing claim is recovered
+            # by normal bounded stale-claim handling, never an unfenced worker.
+            result.respawn_guarded.append((task_id, 'factory_probe_binding_failed'))
+            return False
     try:
         resolved_branch_name = None
         if claimed.workspace_kind == "worktree":
@@ -2578,6 +2609,10 @@ def _dispatch_once_locked(
             break
         row_assignee = row["assignee"]
         if not row_assignee:
+            reason = _factory_policy_guard(conn, row['id'])
+            if reason is not None:
+                result.respawn_guarded.append((row['id'], reason))
+                continue
             # Honour kanban.default_assignee so an unassigned task doesn't
             # park in 'ready' forever.
             if not default_assignee or not _apply_default_assignee(

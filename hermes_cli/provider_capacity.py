@@ -50,6 +50,10 @@ class CapacityBreaker:
                 generation INTEGER NOT NULL, token TEXT,
                 lease_until REAL NOT NULL,
                 PRIMARY KEY(owner, provider))""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS capacity_probe_runs (
+                owner TEXT NOT NULL, provider TEXT NOT NULL, token TEXT NOT NULL,
+                board TEXT NOT NULL, run_id TEXT NOT NULL,
+                PRIMARY KEY(owner, provider))""")
             yield conn
             conn.commit()
         except Exception:
@@ -69,7 +73,7 @@ class CapacityBreaker:
                 raise ValueError("Unexpected probe lease")
         return row
 
-    def acquire(self, owner, provider, *, now):
+    def acquire(self, owner, provider, *, now, probe_alive=None):
         if self.enabled is False:
             return Permit(True, "DISABLED")
         if not self._valid(owner, provider, now):
@@ -81,12 +85,35 @@ class CapacityBreaker:
                     return Permit(True, "CLOSED")
                 if now < row["eligible_at"] or (row["state"] == "HALF_OPEN" and now < row["lease_until"]):
                     return Permit(False, row["state"], eligible_at=max(row["eligible_at"], row["lease_until"]))
+                if row['state'] == 'HALF_OPEN':
+                    binding = conn.execute("SELECT board,run_id FROM capacity_probe_runs WHERE owner=? AND provider=? AND token=?", (owner, provider, row['token'])).fetchone()
+                    # Expiry fences abandoned reservations, not live workers.
+                    # The binding is shared across boards under owner/provider.
+                    if binding is not None and (probe_alive is None or probe_alive(binding['board'], binding['run_id']) is not False):
+                        return Permit(False, 'HALF_OPEN', reason='probe_live_or_unknown')
                 generation = row["generation"] + 1
                 token = f"{generation}:{uuid.uuid4().hex}"
                 conn.execute("UPDATE capacity SET state='HALF_OPEN',generation=?,token=?,lease_until=? WHERE owner=? AND provider=?", (generation, token, now + 60, owner, provider))
                 return Permit(True, "HALF_OPEN", token, now + 60)
         except (sqlite3.Error, ValueError, OSError):
             return Permit(False, "INVALID", reason="capacity_state_unavailable")
+
+    def bind_probe(self, owner, provider, probe_token, *, board, run_id, now):
+        """Bind before spawn; token/generation CAS cannot resurrect OPEN/stale leases."""
+        if not self._valid(owner, provider, now) or not all(isinstance(v, str) and v.strip() for v in (probe_token, board, run_id)):
+            return False
+        try:
+            with self._transaction() as conn:
+                row = self._row(conn, owner, provider)
+                if row is None or row['state'] != 'HALF_OPEN' or row['token'] != probe_token or now >= row['lease_until']:
+                    return False
+                existing = conn.execute('SELECT * FROM capacity_probe_runs WHERE owner=? AND provider=?', (owner, provider)).fetchone()
+                if existing is not None and existing['token'] == probe_token:
+                    return existing['board'] == board and existing['run_id'] == run_id
+                conn.execute('INSERT OR REPLACE INTO capacity_probe_runs VALUES (?,?,?,?,?)', (owner, provider, probe_token, board, run_id))
+                return True
+        except (sqlite3.Error, ValueError, OSError):
+            return False
 
     def rate_limited(self, owner, provider, *, now, board="", reset_at=None):
         if not self._valid(owner, provider, now) or not isinstance(board, str) or (reset_at is not None and not _finite(reset_at)):

@@ -125,3 +125,24 @@ def test_numeric_validation_does_not_swallow_coding_errors(tmp_path):
     b = CapacityBreaker(tmp_path / "capacity.sqlite", enabled=True)
     with pytest.raises(RuntimeError, match="numeric implementation bug"):
         b.acquire("owner", "A", now=BrokenNumber(100))
+
+
+def test_bound_probe_shared_across_boards_and_dead_recovery(tmp_path):
+    from hermes_cli.provider_capacity import CapacityBreaker
+    b = CapacityBreaker(tmp_path / 'capacity.sqlite', enabled=True)
+    assert b.rate_limited('owner', 'A', now=100, board='board-one')
+    probe = b.acquire('owner', 'A', now=401)
+    assert b.bind_probe('owner', 'A', probe.probe_token, board='board-one', run_id='run-one', now=402)
+    seen = []
+    def alive(board, run):
+        seen.append((board, run))
+        return True
+    # A second board shares owner/provider, not its own independent lease.
+    assert not b.acquire('owner', 'A', now=462, probe_alive=alive).allowed
+    assert seen == [('board-one', 'run-one')]
+    assert not b.acquire('owner', 'A', now=463).allowed  # unknown liveness fails closed
+    recovered = b.acquire('owner', 'A', now=464, probe_alive=lambda *args: False)
+    assert recovered.allowed and recovered.probe_token != probe.probe_token
+    assert not b.bind_probe('owner', 'A', probe.probe_token, board='board-one', run_id='stale', now=465)
+    assert b.rate_limited('owner', 'A', now=466)
+    assert not b.success('owner', 'A', recovered.probe_token, now=467)
