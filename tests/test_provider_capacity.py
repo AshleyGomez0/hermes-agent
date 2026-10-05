@@ -3,6 +3,8 @@ import importlib
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
+
 
 def test_restart_persistence_and_provider_isolation(tmp_path):
     assert importlib.util.find_spec("hermes_cli.provider_capacity") is not None
@@ -91,3 +93,35 @@ def test_success_expired_lease_cannot_close(tmp_path):
     b.rate_limited("owner", "A", now=100)
     probe = b.acquire("owner", "A", now=400)
     assert not b.success("owner", "A", probe.probe_token, now=460)
+
+
+@pytest.mark.parametrize("now", [10**400, -(10**400), float("inf"), float("-inf"), float("nan"), True, False, -1], ids=["huge-int", "huge-negative-int", "inf", "negative-inf", "nan", "true", "false", "negative"])
+@pytest.mark.parametrize("operation", ["acquire", "rate_limited", "success", "reset_at"])
+def test_malformed_times_fail_closed_without_state_io(tmp_path, now, operation):
+    from hermes_cli.provider_capacity import CapacityBreaker
+    path = tmp_path / "capacity.sqlite"
+    b = CapacityBreaker(path, enabled=True)
+    if operation == "acquire":
+        permit = b.acquire("owner", "A", now=now)
+        assert not permit.allowed
+        assert permit.state == "INVALID"
+        assert permit.reason == "malformed_config_or_key"
+    elif operation == "success":
+        assert b.success("owner", "A", "probe-token", now=now) is False
+    elif operation == "reset_at":
+        assert b.rate_limited("owner", "A", now=100, reset_at=now) is False
+    else:
+        assert b.rate_limited("owner", "A", now=now) is False
+    assert not path.exists()
+
+
+def test_numeric_validation_does_not_swallow_coding_errors(tmp_path):
+    from hermes_cli.provider_capacity import CapacityBreaker
+
+    class BrokenNumber(int):
+        def __float__(self):
+            raise RuntimeError("numeric implementation bug")
+
+    b = CapacityBreaker(tmp_path / "capacity.sqlite", enabled=True)
+    with pytest.raises(RuntimeError, match="numeric implementation bug"):
+        b.acquire("owner", "A", now=BrokenNumber(100))

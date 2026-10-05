@@ -19,7 +19,14 @@ class Permit:
 
 
 def _finite(value):
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        finite = math.isfinite(value)
+    except OverflowError:
+        # Integers outside float range are malformed timestamps, not permits.
+        return False
+    return finite and value >= 0
 
 
 class CapacityBreaker:
