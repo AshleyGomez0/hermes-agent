@@ -1044,6 +1044,38 @@ class _DeadWorker:
         return "rate_limited" if self.rate_limited else "crashed"
 
 
+def _factory_run_permit(conn, task_id):
+    import json
+    row = conn.execute("SELECT e.payload FROM task_events e JOIN tasks t ON t.current_run_id=e.run_id WHERE t.id=? AND e.task_id=t.id AND e.kind='factory_capacity_permit' ORDER BY e.id DESC LIMIT 1", (task_id,)).fetchone()
+    if row is None:
+        return None
+    permit = json.loads(row['payload'])
+    if not isinstance(permit, dict) or any(not isinstance(permit.get(k), str) or not permit[k].strip() for k in ('owner', 'provider', 'ledger', 'board')):
+        raise ValueError('invalid saved capacity permit')
+    actual = next((r[2] for r in conn.execute('PRAGMA database_list') if r[1] == 'main'), '')
+    if not actual or Path(actual).resolve() != Path(permit['board']).resolve() or not Path(permit['ledger']).is_absolute() or not Path(permit['owner']).is_absolute():
+        raise ValueError('saved permit scope mismatch')
+    return permit
+
+
+def _factory_reset_at(observed):
+    """Accept only finite, nonnegative epoch reset timestamps from an outcome."""
+    import json
+    import math
+    if isinstance(observed, str):
+        try:
+            observed = json.loads(observed)
+        except (ValueError, TypeError):
+            return None
+    value = observed.get('reset_at') if isinstance(observed, dict) else getattr(observed, 'reset_at', None)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        return value if math.isfinite(value) and value >= 0 else None
+    except OverflowError:
+        return None
+
+
 def _classify_dead_worker(
     pid: int, claimer: Optional[str], *, task_id: Optional[str] = None, board: Optional[str] = None,
 ) -> _DeadWorker:
@@ -1054,9 +1086,13 @@ def _classify_dead_worker(
     worker see WHY instead of a bare label; a rate-limited requeue does not need it.
     """
     dead = _classify_dead_worker_exit(pid, claimer, task_id=task_id, board=board)
-    if task_id and not dead.rate_limited:
+    if task_id:
         worker_output = _worker_final_output(task_id, board=board)
-        if worker_output:
+        if dead.rate_limited:
+            reset_at = _factory_reset_at(worker_output)
+            if reset_at is not None:
+                dead.event_payload['reset_at'] = reset_at
+        elif worker_output:
             dead.error_text += f" Worker's last output: {worker_output!r}"
             dead.event_payload["worker_output"] = worker_output
     return dead
@@ -1169,6 +1205,18 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board)
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
+            if dead.rate_limited:
+                # Outcome accounting uses the already-granted run permit, not
+                # today's role policy. It cannot authorize any new dispatch.
+                try:
+                    capacity_context = _factory_run_permit(conn, row['id'])
+                except (ValueError, TypeError, KeyError):
+                    continue  # malformed saved permit: keep the claim fail-closed
+                if capacity_context:
+                    from hermes_cli.provider_capacity import CapacityBreaker
+                    if not CapacityBreaker(capacity_context['ledger'], enabled=True).rate_limited(
+                            capacity_context['owner'], capacity_context['provider'], now=time.time(), board=capacity_context['board'], reset_at=_factory_reset_at(dead.event_payload)):
+                        continue  # fail closed: never requeue before OPEN is durable
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
@@ -2022,6 +2070,80 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
+def _factory_policy_guard(conn: sqlite3.Connection, task_id: str, context=None) -> Optional[str]:
+    """Validate explicit task contracts without mutating assignments or ledger."""
+    import json
+
+    explicit = os.environ.get("HERMES_FACTORY_ROUTING_POLICY", "")
+    if not explicit:
+        return None
+    try:
+        path = Path(explicit)
+        if not path.exists():
+            return None  # missing policy preserves the legacy dispatch path
+        policy = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(policy, dict) or type(policy.get("schema_version")) is not int or policy["schema_version"] != 1:
+            raise ValueError("expected schema_version=1")
+        if type(policy.get("enabled")) is not bool:
+            raise ValueError("enabled must be boolean")
+        if not policy["enabled"]:
+            return None
+        owner = policy.get("owner_home")
+        board_db = policy.get("board_db")
+        if not isinstance(owner, str) or not owner.strip() or not Path(owner).is_absolute():
+            raise ValueError("owner_home must be an absolute canonical OAuth root")
+        if not isinstance(board_db, str) or not Path(board_db).is_absolute():
+            raise ValueError("board_db must be absolute")
+        actual = next((r[2] for r in conn.execute("PRAGMA database_list") if r[1] == "main"), "")
+        if not actual or Path(actual).resolve() != Path(board_db).resolve():
+            raise ValueError("policy board_db differs from this connection")
+        if policy.get("require_independent_reviewer") is not True:
+            raise ValueError("independent reviewer is required")
+        qwen = policy.get("qwen")
+        if (not isinstance(qwen, dict) or qwen.get("bounded_only") is not True
+                or qwen.get("tools") is not False or policy.get("deterministic") != "scripts"):
+            raise ValueError("bounded Qwen / deterministic scripts policy required")
+        routes = policy.get("routes")
+        if not isinstance(routes, dict) or not routes or routes.get("minimax", {}).get("preserved") is not True:
+            raise ValueError("routes must preserve MiniMax")
+        eligible = []
+        for route in routes.values():
+            if not isinstance(route, dict):
+                raise ValueError("route must be an object")
+            if "provider" not in route:
+                continue
+            if any(not isinstance(route.get(k), str) or not route[k].strip() for k in ("provider", "model", "profile")):
+                raise ValueError("explicit route requires profile/provider/model")
+            roles = route.get("eligible_roles")
+            if not isinstance(roles, list) or not roles or any(r not in ("writer", "read_only", "test_fix", "independent_reviewer") for r in roles):
+                raise ValueError("invalid eligible_roles")
+            eligible.append(route)
+        contracts = policy.get('task_roles', {})
+        contract = contracts.get(task_id) if isinstance(contracts, dict) else None
+        if isinstance(contract, str):
+            contract = {'role': contract}
+        if not isinstance(contract, dict):
+            return 'factory_missing_role_adapter'
+        role = contract.get('role')
+        if role == 'independent_reviewer':
+            import re
+            writer = contract.get('writer_task_id')
+            sha = contract.get('reviewed_sha')
+            if not isinstance(writer, str) or not writer.strip() or writer == task_id or not isinstance(sha, str) or re.fullmatch(r'[0-9a-fA-F]{40}', sha) is None:
+                return 'factory_invalid_review_contract'
+        row = conn.execute('SELECT provider_override, model_override, assignee FROM tasks WHERE id=?', (task_id,)).fetchone()
+        route = next((r for r in eligible if row is not None and tuple(row) == (r['provider'], r['model'], r['profile']) and role in r['eligible_roles']), None)
+        if route is None:
+            return 'factory_route_mismatch'
+        if context is not None:
+            context.update(owner=os.path.normcase(str(Path(owner).resolve())), provider=route['provider'],
+                           ledger=str(path.resolve().parent / 'capacity.sqlite'), board=str(Path(board_db).resolve()))
+        return None
+    except (OSError, ValueError, TypeError, AttributeError, sqlite3.Error) as exc:
+        _kb._log.warning("kanban: explicit Factory routing policy invalid (%s); dispatch deferred", exc)
+        return "factory_policy_invalid"
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2070,7 +2192,10 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
-    guard_reason = check_respawn_guard(conn, task_id, lane=lane)
+    factory_context = {}
+    guard_reason = _factory_policy_guard(conn, task_id, factory_context)
+    if guard_reason is None:
+        guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
         # Event so ``hermes kanban tail`` shows why the task looks stuck.
@@ -2095,10 +2220,25 @@ def _dispatch_lane_task(
         result.spawned.append((task_id, assignee, ""))
         _count_spawn(assignee)
         return True
+    if factory_context:
+        from hermes_cli.provider_capacity import CapacityBreaker
+        permit = CapacityBreaker(factory_context['ledger'], enabled=True).acquire(
+            factory_context['owner'], factory_context['provider'], now=time.time())
+        if not permit.allowed:
+            result.respawn_guarded.append((task_id, 'factory_capacity_' + permit.state.lower()))
+            return False
+        factory_context.update(probe_token=permit.probe_token,
+                               generation=int(permit.probe_token.split(':', 1)[0]) if permit.probe_token else None)
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
         return False
+    if factory_context:
+        with _kb.write_txn(conn):
+            run_id = _kb._current_run_id(conn, task_id)
+            conn.execute('UPDATE task_runs SET metadata=? WHERE id=?', (_kb._json_or_null({'factory_capacity': factory_context}), run_id))
+            # Terminal helpers replace metadata; retain permit as a run-keyed event.
+            _kb._append_event(conn, task_id, 'factory_capacity_permit', factory_context, run_id=run_id)
     try:
         resolved_branch_name = None
         if claimed.workspace_kind == "worktree":
@@ -2133,6 +2273,20 @@ def _dispatch_lane_task(
         _count_spawn(claimed.assignee)
         return True
     except Exception as exc:
+        response = getattr(exc, 'response', None)
+        status = getattr(exc, 'status_code', None) or getattr(response, 'status_code', None) or getattr(exc, 'code', None)
+        if status == 429:
+            from hermes_cli.provider_capacity import CapacityBreaker
+            if factory_context and not CapacityBreaker(factory_context['ledger'], enabled=True).rate_limited(
+                    factory_context['owner'], factory_context['provider'], now=time.time(), board=factory_context['board'], reset_at=_factory_reset_at(exc)):
+                return False  # keep the claim until OPEN can be persisted
+            error = f'HTTP 429 quota wall: {exc}'
+            with _kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status=?,claim_lock=NULL,claim_expires=NULL,worker_pid=NULL,worker_started_at=NULL,last_failure_error=? WHERE id=?", (lane, error[:500], claimed.id))
+                run_id = _kb._end_run(conn, claimed.id, outcome='rate_limited', status='rate_limited', error=error)
+                _kb._append_event(conn, claimed.id, 'rate_limited', {'status_code': 429, 'retry_status': lane}, run_id=run_id)
+            result.rate_limited.append(claimed.id)
+            return False
         from tools.process_registry import RestartSafeScopeUnavailable
 
         # The host refused the spawn (no restart-safe scope): nothing about the
@@ -2180,6 +2334,27 @@ def _apply_default_assignee(
     return True
 
 
+def _factory_recover_successes(conn):
+    """Run-keyed durable permit survives terminal metadata replacement/restart."""
+    import json
+    from hermes_cli.provider_capacity import CapacityBreaker
+    rows = conn.execute("SELECT r.id,r.task_id,e.payload FROM task_runs r JOIN task_events e ON e.run_id=r.id AND e.kind='factory_capacity_permit' WHERE r.outcome='completed' AND r.ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM task_events x WHERE x.run_id=r.id AND x.kind='factory_capacity_observed')").fetchall()
+    for row in rows:
+        context = {}
+        if _factory_policy_guard(conn, row['task_id'], context) is not None or not context:
+            continue
+        try:
+            permit = json.loads(row['payload'])
+            if any(permit.get(k) != context[k] for k in ('owner', 'provider', 'ledger', 'board')):
+                continue
+            token = permit.get('probe_token')
+            closed = CapacityBreaker(context['ledger'], enabled=True).success(context['owner'], context['provider'], token, now=time.time()) if token else False
+            with _kb.write_txn(conn):
+                _kb._append_event(conn, row['task_id'], 'factory_capacity_observed', {'closed': closed}, run_id=row['id'])
+        except (ValueError, TypeError, KeyError):
+            continue
+
+
 def _run_reclaim_phase(
     conn: sqlite3.Connection,
     result: DispatchResult,
@@ -2197,6 +2372,7 @@ def _run_reclaim_phase(
         result.reconciled_orphans = reconcile_orphaned_running(conn)
     result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
     result.crashed = detect_crashed_workers(conn, board=board)
+    _factory_recover_successes(conn)
     # Side-channel attributes (see detect_crashed_workers); rate-limited tasks
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
