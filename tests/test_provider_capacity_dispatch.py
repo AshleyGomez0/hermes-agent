@@ -63,7 +63,11 @@ def completed_writer_contract(board):
         'commit', '--allow-empty', '-m', 'independent review fixture')
     writer = card(conn)
     with kb.write_txn(conn):
-        conn.execute("UPDATE tasks SET status='done',workspace_kind='dir',workspace_path=? WHERE id=?", (str(repo), writer))
+        conn.execute("UPDATE tasks SET workspace_kind='dir',workspace_path=? WHERE id=?", (str(repo), writer))
+    assert kb.claim_task(conn, writer)
+    assert kb.complete_task(conn, writer, result='fixture writer completed',
+        metadata={'worker_session_id': 'fixture-worker:'+writer},
+        expected_run_id=kb._current_run_id(conn, writer), fire_lifecycle_hook=False)
     return {'role': 'independent_reviewer', 'writer_task_id': writer,
             'reviewed_sha': git('rev-parse', 'HEAD')}
 

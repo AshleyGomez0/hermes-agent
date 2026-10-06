@@ -73,6 +73,11 @@ def test_guarded_reviewer_rejects_nonexistent_writer(board, monkeypatch):
     assert conn.execute('SELECT COUNT(*) FROM task_runs').fetchone()[0] == 0
 
 
+def writer_run_id(conn, writer):
+    # _end_run clears current_run_id. The latest historical attempt is durable.
+    return conn.execute('SELECT id FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1', (writer,)).fetchone()[0]
+
+
 def completed_writer(board):
     import subprocess
     conn, home, root = board
@@ -81,7 +86,9 @@ def completed_writer(board):
         return subprocess.check_output(['git', '-C', str(repo), *args], text=True).strip()
     git('init'); git('-c', 'user.name=Offline', '-c', 'user.email=offline@example.invalid', 'commit', '--allow-empty', '-m', 'fixture')
     writer = card(conn)
-    conn.execute("UPDATE tasks SET status='done',workspace_kind='dir',workspace_path=? WHERE id=?", (str(repo), writer)); conn.commit()
+    conn.execute("UPDATE tasks SET workspace_kind='dir',workspace_path=? WHERE id=?", (str(repo), writer)); conn.commit()
+    assert kb.claim_task(conn, writer)
+    assert kb.complete_task(conn, writer, result='fixture writer completed', metadata={'worker_session_id': 'fixture-worker:'+writer}, expected_run_id=kb._current_run_id(conn,writer), fire_lifecycle_hook=False)
     return writer, repo, git('rev-parse', 'HEAD')
 
 
@@ -104,7 +111,7 @@ def test_review_contract_durable_before_spawn(board, monkeypatch):
     def spawn(t, workspace):
         run = conn.execute('SELECT id,metadata FROM task_runs WHERE task_id=?', (task,)).fetchone()
         binding = json.loads(run['metadata'])['factory_review']
-        assert binding == {'writer_task_id': writer, 'source_workspace': str(repo.resolve()), 'reviewed_sha': sha, 'read_only': True}
+        assert binding == {'writer_task_id': writer, 'source_workspace': str(repo.resolve()), 'reviewed_sha': sha, 'read_only': True, 'writer_run_id': writer_run_id(conn, writer), 'writer_session_id': 'fixture-worker:'+writer}
         context = kb.build_worker_context(conn, task)
         assert sha in context and writer in context and 'READ_ONLY' in context
         observed.append(run['id'])
@@ -112,7 +119,7 @@ def test_review_contract_durable_before_spawn(board, monkeypatch):
     assert observed, 'Native context must include frozen read-only binding before spawn'
 
 
-@pytest.mark.parametrize('bad', ['sha', 'self', 'phase', 'path', 'git', 'session'])
+@pytest.mark.parametrize('bad', ['sha', 'self', 'phase', 'path', 'git', 'writer_session_missing'])
 def test_review_binding_fail_closed(board, monkeypatch, bad):
     conn, home, root = board
     task, writer, repo, sha = bound_review(board, monkeypatch)
@@ -122,7 +129,7 @@ def test_review_binding_fail_closed(board, monkeypatch, bad):
     elif bad == 'phase': conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (writer,))
     elif bad == 'path': conn.execute('UPDATE tasks SET workspace_path=NULL WHERE id=?', (writer,))
     elif bad == 'git': conn.execute('UPDATE tasks SET workspace_path=? WHERE id=?', (str(root), writer))
-    elif bad == 'session': conn.execute('UPDATE tasks SET session_id=? WHERE id IN (?,?)', ('same-session', writer, task))
+    elif bad == 'writer_session_missing': conn.execute("UPDATE task_runs SET metadata='{}' WHERE id=?", (writer_run_id(conn, writer),))
     conn.commit(); policy(board, monkeypatch, task_roles={task: contract})
     assert tick(conn)[1] == []
     assert conn.execute('SELECT COUNT(*) FROM task_runs WHERE task_id=?', (task,)).fetchone()[0] == 0
@@ -135,7 +142,7 @@ def test_review_completion_rejects_bad_callback(board, monkeypatch, bad):
     task, writer, repo, sha = bound_review(board, monkeypatch)
     assert tick(conn)[1] == [task]
     run_id = kb._current_run_id(conn, task)
-    metadata = {'factory_review': {'writer_task_id': writer, 'source_workspace': str(repo.resolve()), 'reviewed_sha': sha, 'read_only': True}}
+    metadata = {'factory_review': {'writer_task_id': writer, 'source_workspace': str(repo.resolve()), 'reviewed_sha': sha, 'read_only': True, 'writer_run_id': writer_run_id(conn, writer), 'writer_session_id': 'fixture-worker:'+writer}, 'worker_session_id': 'fixture-reviewer:'+task}
     if bad == 'event_missing':
         conn.execute("DELETE FROM task_events WHERE task_id=? AND run_id=? AND kind='factory_review_bound'", (task, run_id)); conn.commit()
     elif bad == 'event_duplicate':
@@ -162,7 +169,7 @@ def test_review_completion_accepts_exact_frozen_binding(board, monkeypatch):
     task, writer, repo, sha = bound_review(board, monkeypatch)
     assert tick(conn)[1] == [task]
     run_id = kb._current_run_id(conn, task)
-    metadata = {'factory_review': {'writer_task_id': writer, 'source_workspace': str(repo.resolve()), 'reviewed_sha': sha, 'read_only': True}}
+    metadata = {'factory_review': {'writer_task_id': writer, 'source_workspace': str(repo.resolve()), 'reviewed_sha': sha, 'read_only': True, 'writer_run_id': writer_run_id(conn, writer), 'writer_session_id': 'fixture-worker:'+writer}, 'worker_session_id': 'fixture-reviewer:'+task}
     assert kb.complete_task(conn, task, result='review accepted', metadata=metadata, expected_run_id=run_id, fire_lifecycle_hook=False)
     assert json.loads(conn.execute('SELECT metadata FROM task_runs WHERE id=?', (run_id,)).fetchone()[0])['factory_review'] == metadata['factory_review']
 
@@ -171,3 +178,56 @@ def test_existing_worker_billing_exit75(monkeypatch):
     from hermes_cli.cli_single_query import _single_query_exit_code
     monkeypatch.setenv('HERMES_KANBAN_TASK', 'offline-control')
     assert _single_query_exit_code({'failed': True, 'failure_reason': 'billing'}) == kb.KANBAN_RATE_LIMIT_EXIT_CODE == 75
+
+
+# CP18 worker-execution identity regressions. Origin session_id is NOT execution identity.
+@pytest.mark.parametrize('bad', ['missing', 'blank', 'same', 'writer_changed', 'run_changed'])
+def test_worker_identity_rejects_unknown_self_or_changed(board, monkeypatch, bad):
+    conn, home, root = board
+    task, writer, repo, sha = bound_review(board, monkeypatch)
+    assert tick(conn)[1] == [task]
+    run_id = kb._current_run_id(conn, task)
+    binding = json.loads(conn.execute('SELECT metadata FROM task_runs WHERE id=?', (run_id,)).fetchone()[0])['factory_review']
+    metadata = {'factory_review': binding, 'worker_session_id': 'fixture-reviewer:'+task}
+    if bad == 'missing': metadata.pop('worker_session_id')
+    elif bad == 'blank': metadata['worker_session_id'] = ' '
+    elif bad == 'same': metadata['worker_session_id'] = 'fixture-worker:'+writer
+    elif bad == 'writer_changed':
+        conn.execute('UPDATE task_runs SET metadata=? WHERE id=?', (json.dumps({'worker_session_id':'changed-worker-session'}), writer_run_id(conn,writer)));conn.commit()
+    elif bad == 'run_changed':
+        conn.execute('UPDATE tasks SET current_run_id=999999 WHERE id=?',(writer,));conn.commit()
+    before=tuple(conn.execute('SELECT * FROM tasks WHERE id=?',(task,)).fetchone())
+    assert kb.complete_task(conn,task,result='candidate verdict',metadata=metadata,expected_run_id=run_id,fire_lifecycle_hook=False) is False
+    assert tuple(conn.execute('SELECT * FROM tasks WHERE id=?',(task,)).fetchone()) == before
+
+
+def test_same_creator_origin_allows_distinct_worker_sessions(board, monkeypatch):
+    conn, home, root = board
+    task, writer, repo, sha = bound_review(board, monkeypatch)
+    conn.execute('UPDATE tasks SET session_id=? WHERE id IN (?,?)',('same-foreman-origin',task,writer));conn.commit()
+    assert tick(conn)[1] == [task]
+    run_id=kb._current_run_id(conn,task)
+    bound=json.loads(conn.execute('SELECT metadata FROM task_runs WHERE id=?',(run_id,)).fetchone()[0])['factory_review']
+    assert bound['writer_run_id']==writer_run_id(conn,writer)
+    assert bound['writer_session_id']=='fixture-worker:'+writer
+    assert kb.complete_task(conn,task,result='independent verdict',metadata={'factory_review':bound,'worker_session_id':'different-executor'},expected_run_id=run_id,fire_lifecycle_hook=False)
+
+
+def test_uppercase_sha_normalizes_to_canonical_binding(board, monkeypatch):
+    conn, home, root=board
+    task,writer,repo,sha=bound_review(board,monkeypatch)
+    policy(board,monkeypatch,task_roles={task:{'role':'independent_reviewer','writer_task_id':writer,'reviewed_sha':sha.upper()}})
+    assert tick(conn)[1]==[task]
+    binding=json.loads(conn.execute('SELECT metadata FROM task_runs WHERE id=?',(kb._current_run_id(conn,task),)).fetchone()[0])['factory_review']
+    assert binding['reviewed_sha']==sha
+
+
+def test_worker_session_stamp_rejects_forged_metadata(monkeypatch):
+    from tools.kanban_tools import _stamp_worker_session_metadata
+    original={'field':'keep','worker_session_id':'forged'}
+    monkeypatch.setenv('HERMES_KANBAN_TASK','own-task');monkeypatch.setenv('HERMES_SESSION_ID','real-runtime-session')
+    assert _stamp_worker_session_metadata('own-task',original)['worker_session_id']=='real-runtime-session'
+    assert _stamp_worker_session_metadata('foreign-task',original)=={'field':'keep'}
+    monkeypatch.delenv('HERMES_SESSION_ID')
+    assert _stamp_worker_session_metadata('own-task',original)=={'field':'keep'}
+    assert original['worker_session_id']=='forged'

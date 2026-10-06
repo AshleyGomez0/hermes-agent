@@ -219,7 +219,13 @@ def _worker_run_id(task_id: str) -> Optional[int]:
 def _stamp_worker_session_metadata(task_id: str, metadata: Optional[dict]) -> Optional[dict]:
     """Add trusted worker session id metadata for this worker's own task."""
     session_id = _own_task_env(task_id, "HERMES_SESSION_ID")
-    return {**(metadata or {}), "worker_session_id": session_id} if session_id else metadata
+    # Model-supplied metadata cannot impersonate an executing worker. Preserve
+    # other metadata, but only the task-scoped runtime may stamp this identity.
+    stamped = dict(metadata or {})
+    stamped.pop("worker_session_id", None)
+    if session_id:
+        stamped["worker_session_id"] = session_id
+    return stamped if stamped or metadata is not None else None
 
 
 def _enforce_worker_task_ownership(tid: str) -> None:

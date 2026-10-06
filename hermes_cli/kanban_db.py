@@ -2728,20 +2728,52 @@ def _claim_is_live(trow) -> bool:
     )
 
 
+def _factory_session_id_valid(value):
+    return isinstance(value, str) and 0 < len(value) <= 256 and not any(c.isspace() for c in value)
+
+
+def _factory_completed_writer_identity(conn, writer_id):
+    """Use the worker-stamped terminal run, never the task's creator-origin session."""
+    import json
+    try:
+        # Native _end_run clears tasks.current_run_id after completion. Bind
+        # the latest attempt, not an older successful attempt or a live run.
+        if _current_run_id(conn, writer_id) is not None:
+            return None
+        row = conn.execute(
+            "SELECT id, status, outcome, ended_at, metadata FROM task_runs "
+            "WHERE task_id=? ORDER BY id DESC LIMIT 1", (writer_id,)).fetchone()
+        if row is None or row['status'] != 'done' or row['outcome'] != 'completed' or row['ended_at'] is None:
+            return None
+        metadata = json.loads(row['metadata'] or '{}')
+        session = metadata.get('worker_session_id') if isinstance(metadata, dict) else None
+        if not _factory_session_id_valid(session):
+            return None
+        return {'writer_run_id': row['id'], 'writer_session_id': session}
+    except (TypeError, ValueError, KeyError, sqlite3.Error):
+        return None
+
+
 def _factory_writer_snapshot(conn, reviewer_id, writer_id, reviewed_sha, *, completing=False):
-    """Bind a distinct completed writer to its real committed Git workspace."""
+    """Bind a completed writer's exact run/session and its clean committed workspace.
+
+    tasks.session_id is creator provenance inherited by siblings. It is not the
+    executing worker. Native kanban_complete stamps worker_session_id into the
+    terminal run; the reviewer must later supply a different runtime-stamped id.
+    The same provider/profile/model is allowed with genuinely separate sessions.
+    """
     import re
     import subprocess
-    if writer_id == reviewer_id or not isinstance(reviewed_sha, str) or re.fullmatch(r'[0-9a-f]{40}', reviewed_sha) is None:
+    if writer_id == reviewer_id or not isinstance(reviewed_sha, str) or re.fullmatch(r'[0-9a-fA-F]{40}', reviewed_sha) is None:
         return None
+    reviewed_sha = reviewed_sha.lower()
     writer = get_task(conn, writer_id)
     reviewer = get_task(conn, reviewer_id)
-    # claim_review_task moves review -> running. Completion validates that live
-    # review run; admission still requires the pre-claim review phase.
     expected_phase = 'running' if completing else 'review'
     if writer is None or writer.status != 'done' or reviewer is None or reviewer.status != expected_phase:
         return None
-    if writer.session_id and writer.session_id == reviewer.session_id:
+    identity = _factory_completed_writer_identity(conn, writer_id)
+    if identity is None:
         return None
     try:
         path = Path(writer.workspace_path).resolve(strict=True)
@@ -2755,7 +2787,7 @@ def _factory_writer_snapshot(conn, reviewer_id, writer_id, reviewed_sha, *, comp
             return None
         if git('status', '--porcelain', '--untracked-files=all'):
             return None
-        return {'writer_task_id': writer_id, 'source_workspace': str(path), 'reviewed_sha': reviewed_sha, 'read_only': True}
+        return {'writer_task_id': writer_id, 'source_workspace': str(path), 'reviewed_sha': reviewed_sha, 'read_only': True, **identity}
     except (OSError, TypeError, ValueError, subprocess.SubprocessError):
         return None
 
@@ -2787,12 +2819,18 @@ def _factory_review_completion_valid(conn, task_id, expected_run_id, metadata):
         if len(events) != 1 or expected_run_id is None or int(expected_run_id) != run_id:
             return False
         bound = json.loads(events[0]['payload'])
-        keys = {'writer_task_id', 'source_workspace', 'reviewed_sha', 'read_only'}
+        keys = {'writer_task_id', 'source_workspace', 'reviewed_sha', 'read_only', 'writer_run_id', 'writer_session_id'}
         if not isinstance(bound, dict) or set(bound) != keys or bound['read_only'] is not True:
             return False
         if not isinstance(saved, dict) or saved.get('factory_review') != bound:
             return False
         if not isinstance(metadata, dict) or metadata.get('factory_review') != bound:
+            return False
+        # Unknown execution identity is not independent-review proof.
+        reviewer_session = metadata.get('worker_session_id')
+        if not _factory_session_id_valid(reviewer_session) or reviewer_session == bound['writer_session_id']:
+            return False
+        if type(bound['writer_run_id']) is not int or not _factory_session_id_valid(bound['writer_session_id']):
             return False
         actual = _factory_writer_snapshot(conn, task_id, bound['writer_task_id'], bound['reviewed_sha'], completing=True)
         return actual == bound

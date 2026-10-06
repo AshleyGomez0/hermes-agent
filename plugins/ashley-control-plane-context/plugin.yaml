@@ -1,0 +1,8 @@
+name: ashley-control-plane-context
+label: Ashley Control Plane Context
+kind: standalone
+version: 1.0.0
+description: Read-only current authority context for fresh and resumed Control Plane sessions.
+provides_hooks:
+  - pre_llm_call
+  - pre_tool_call

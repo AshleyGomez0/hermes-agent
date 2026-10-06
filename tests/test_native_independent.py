@@ -70,6 +70,9 @@ def test_two_real_temp_boards_one_ledger(board, monkeypatch, lane, evidence):
         policy((bconn,owner_home,root),monkeypatch,board_db=str(bdb),task_roles={taskb:contract(bconn)})
         monkeypatch.setattr(dispatch.time,'time',lambda:now+61)
         bcalls=[]
+        # Positive review fixture now has a real completed writer run. A blocked
+        # probe must preserve that history and create no reviewer run.
+        before_runs=[tuple(r) for r in bconn.execute('SELECT * FROM task_runs ORDER BY id')]
         result=dispatch.dispatch_once(bconn,spawn_fn=lambda task,workspace:bcalls.append(task.id) or 987655)
         allowed=evidence in ('dead','terminal')
         assert bcalls==([taskb] if allowed else [])
@@ -77,7 +80,8 @@ def test_two_real_temp_boards_one_ledger(board, monkeypatch, lane, evidence):
             assert seen==[(987654,'offline-A-fingerprint')]
         if not allowed:
             assert bconn.execute('SELECT status,claim_lock FROM tasks WHERE id=?',(taskb,)).fetchone()[:]==(lane,None)
-            assert bconn.execute('SELECT COUNT(*) FROM task_runs').fetchone()[0]==0
+            assert bconn.execute('SELECT COUNT(*) FROM task_runs WHERE task_id=?',(taskb,)).fetchone()[0]==0
+            assert [tuple(r) for r in bconn.execute('SELECT * FROM task_runs ORDER BY id')]==before_runs
         print('CROSS_BOARD',lane,evidence,'A',adb,'B',bdb,'B_spawned',bcalls,'identity_reads',seen)
 
 @pytest.mark.parametrize('lane',['ready','review'])
