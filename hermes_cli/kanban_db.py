@@ -2792,6 +2792,45 @@ def _factory_writer_snapshot(conn, reviewer_id, writer_id, reviewed_sha, *, comp
         return None
 
 
+def bind_factory_worker_identity(conn, task_id, expected_run_id, worker_session_id):
+    """Bind the native worker before its first model call, not callback-provided identity.
+
+    Non-Factory tasks retain the legacy registration path. A bound reviewer
+    must be this process, on this claimed run, with the dispatcher fingerprint.
+    No PID adoption, session changes or replacement of an existing identity here.
+    """
+    import json
+    from hermes_cli import kanban_db_dispatch as dispatch
+    try:
+        with write_txn(conn):
+            row = conn.execute("SELECT r.metadata,r.worker_pid,r.worker_started_at,t.status,t.current_run_id "
+                "FROM task_runs r JOIN tasks t ON t.id=r.task_id WHERE r.id=? AND r.task_id=?",
+                (expected_run_id, task_id)).fetchone()
+            if row is None:
+                return False
+            saved = json.loads(row['metadata'] or '{}')
+            if not isinstance(saved, dict):
+                return False
+            if 'factory_review' not in saved:
+                return True
+            pid = os.getpid()
+            fingerprint = dispatch._process_fingerprint(pid)
+            if (row['status'] != 'running' or row['current_run_id'] != expected_run_id
+                    or row['worker_pid'] != pid or not fingerprint
+                    or fingerprint != row['worker_started_at']
+                    or not _factory_session_id_valid(worker_session_id)):
+                return False
+            identity = {'pid': pid, 'fingerprint': fingerprint, 'session_id': worker_session_id}
+            events = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+                "AND kind='factory_worker_started' ORDER BY id", (task_id, expected_run_id)).fetchall()
+            if events:
+                return len(events) == 1 and json.loads(events[0]['payload']) == identity
+            _append_event(conn, task_id, 'factory_worker_started', identity, run_id=expected_run_id)
+        return True
+    except (ValueError, TypeError, KeyError, OSError, sqlite3.Error):
+        return False
+
+
 def _factory_review_completion_valid(conn, task_id, expected_run_id, metadata):
     """Accept an opted-in Factory review only against its immutable dispatch event.
 
@@ -2807,7 +2846,7 @@ def _factory_review_completion_valid(conn, task_id, expected_run_id, metadata):
         events = conn.execute(
             "SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
             "AND kind='factory_review_bound' ORDER BY id", (task_id, run_id)).fetchall()
-        row = conn.execute('SELECT metadata FROM task_runs WHERE id=? AND task_id=?',
+        row = conn.execute('SELECT metadata,worker_pid,worker_started_at FROM task_runs WHERE id=? AND task_id=?',
                            (run_id, task_id)).fetchone()
         saved = json.loads(row['metadata'] or '{}') if row is not None else {}
         saved_has_review = isinstance(saved, dict) and (
@@ -2829,6 +2868,17 @@ def _factory_review_completion_valid(conn, task_id, expected_run_id, metadata):
         # Unknown execution identity is not independent-review proof.
         reviewer_session = metadata.get('worker_session_id')
         if not _factory_session_id_valid(reviewer_session) or reviewer_session == bound['writer_session_id']:
+            return False
+        starts = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+            "AND kind='factory_worker_started' ORDER BY id", (task_id, run_id)).fetchall()
+        if len(starts) != 1 or row is None:
+            return False
+        started = json.loads(starts[0]['payload'])
+        if (not isinstance(started, dict) or set(started) != {'pid', 'fingerprint', 'session_id'}
+                or type(started['pid']) is not int or started['pid'] <= 0
+                or started['pid'] != row['worker_pid']
+                or not started['fingerprint'] or started['fingerprint'] != row['worker_started_at']
+                or started['session_id'] != reviewer_session):
             return False
         if type(bound['writer_run_id']) is not int or not _factory_session_id_valid(bound['writer_session_id']):
             return False

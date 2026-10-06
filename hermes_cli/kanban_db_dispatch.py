@@ -1402,6 +1402,7 @@ def _record_task_failure(
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
     infrastructure: bool = False,
+    expected_run_id: Optional[int] = None,
 ) -> bool:
     """Record a non-success outcome and maybe trip the circuit breaker; every
     non-success path funnels through here so ``consecutive_failures`` stays
@@ -1425,6 +1426,12 @@ def _record_task_failure(
         failure_limit = DEFAULT_FAILURE_LIMIT
     error = error[:500]
     with _kb.write_txn(conn):
+        if expected_run_id is not None:
+            own = conn.execute('SELECT current_run_id,status FROM tasks WHERE id=?',(task_id,)).fetchone()
+            if own is None or own['current_run_id'] != expected_run_id or own['status'] != 'running':
+                return False
+            if event_payload_extra and event_payload_extra.get('factory_scope_deferred'):
+                _kb._append_event(conn, task_id, 'factory_scope_deferred', {'reason':error}, run_id=expected_run_id)
         row = conn.execute(
             "SELECT consecutive_failures, status, max_retries, current_run_id "
             "FROM tasks WHERE id = ?", (task_id,),
@@ -1511,6 +1518,7 @@ def _record_task_failure(
             payload.update(event_payload_extra)
         _kb._append_event(conn, task_id, "gave_up", payload, run_id=run_id)
         return True
+
 
 
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
@@ -2181,7 +2189,8 @@ def _factory_policy_guard(conn: sqlite3.Connection, task_id: str, context=None) 
             return 'factory_route_mismatch'
         if context is not None:
             context.update(owner=os.path.normcase(str(Path(owner).resolve())), provider=route['provider'],
-                           ledger=str(path.resolve().parent / 'capacity.sqlite'), board=str(Path(board_db).resolve()))
+                           ledger=str(path.resolve().parent / 'capacity.sqlite'), board=str(Path(board_db).resolve()),
+                           role=role)
         return None
     except (OSError, ValueError, TypeError, AttributeError, sqlite3.Error) as exc:
         _kb._log.warning("kanban: explicit Factory routing policy invalid (%s); dispatch deferred", exc)
@@ -2412,24 +2421,42 @@ def _apply_default_assignee(
 
 
 def _factory_recover_successes(conn):
-    """Run-keyed durable permit survives terminal metadata replacement/restart."""
+    """Recover a completed probe from its immutable run permit, not live admission.
+
+    A finished review is no longer in the dispatchable review phase. The permit
+    that admitted that run remains authoritative for capacity accounting even
+    after routing changes; generation-token CAS prevents a late success closing
+    a newer OPEN breaker. This does not certify review or deployment health.
+    """
     import json
     from hermes_cli.provider_capacity import CapacityBreaker
-    rows = conn.execute("SELECT r.id,r.task_id,e.payload FROM task_runs r JOIN task_events e ON e.run_id=r.id AND e.kind='factory_capacity_permit' WHERE r.outcome='completed' AND r.ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM task_events x WHERE x.run_id=r.id AND x.kind='factory_capacity_observed')").fetchall()
+    actual_board = next((r[2] for r in conn.execute('PRAGMA database_list') if r[1] == 'main'), '')
+    rows = conn.execute("SELECT r.id,r.task_id,e.payload FROM task_runs r JOIN task_events e "
+        "ON e.run_id=r.id AND e.task_id=r.task_id AND e.kind='factory_capacity_permit' "
+        "WHERE r.outcome='completed' AND r.ended_at IS NOT NULL "
+        "AND (SELECT COUNT(*) FROM task_events p WHERE p.run_id=r.id AND p.task_id=r.task_id "
+        "AND p.kind='factory_capacity_permit')=1 "
+        "AND NOT EXISTS (SELECT 1 FROM task_events x WHERE x.run_id=r.id AND x.task_id=r.task_id "
+        "AND x.kind='factory_capacity_observed')").fetchall()
     for row in rows:
-        context = {}
-        if _factory_policy_guard(conn, row['task_id'], context) is not None or not context:
-            continue
         try:
             permit = json.loads(row['payload'])
-            if any(permit.get(k) != context[k] for k in ('owner', 'provider', 'ledger', 'board')):
+            if not isinstance(permit, dict) or any(not isinstance(permit.get(k), str) or not permit[k]
+                    for k in ('owner', 'provider', 'ledger', 'board')):
+                continue
+            if (not actual_board or not all(Path(permit[k]).is_absolute() for k in ('owner','ledger','board'))
+                    or Path(permit['board']).resolve() != Path(actual_board).resolve()):
                 continue
             token = permit.get('probe_token')
-            closed = CapacityBreaker(context['ledger'], enabled=True).success(context['owner'], context['provider'], token, now=time.time()) if token else False
+            if token is not None and not isinstance(token, str):
+                continue
+            closed = CapacityBreaker(permit['ledger'], enabled=True).success(
+                permit['owner'], permit['provider'], token, now=time.time()) if token else False
             with _kb.write_txn(conn):
                 _kb._append_event(conn, row['task_id'], 'factory_capacity_observed', {'closed': closed}, run_id=row['id'])
-        except (ValueError, TypeError, KeyError):
+        except (OSError, sqlite3.Error, ValueError, TypeError, KeyError):
             continue
+
 
 
 def _run_reclaim_phase(

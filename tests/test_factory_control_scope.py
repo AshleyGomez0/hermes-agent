@@ -135,6 +135,13 @@ def test_review_binding_fail_closed(board, monkeypatch, bad):
     assert conn.execute('SELECT COUNT(*) FROM task_runs WHERE task_id=?', (task,)).fetchone()[0] == 0
 
 
+def bind_review_fixture(conn, task, session=None):
+    """Use the native registration binder with this isolated test process."""
+    import os
+    dispatch._set_worker_pid(conn, task, os.getpid())
+    assert kb.bind_factory_worker_identity(conn, task, kb._current_run_id(conn, task), session or 'fixture-reviewer:'+task)
+
+
 @pytest.mark.parametrize('bad', ['missing', 'sha', 'mutation', 'head', 'metadata', 'event_missing', 'event_duplicate'])
 def test_review_completion_rejects_bad_callback(board, monkeypatch, bad):
     import subprocess
@@ -142,6 +149,7 @@ def test_review_completion_rejects_bad_callback(board, monkeypatch, bad):
     task, writer, repo, sha = bound_review(board, monkeypatch)
     assert tick(conn)[1] == [task]
     run_id = kb._current_run_id(conn, task)
+    bind_review_fixture(conn, task)
     metadata = {'factory_review': {'writer_task_id': writer, 'source_workspace': str(repo.resolve()), 'reviewed_sha': sha, 'read_only': True, 'writer_run_id': writer_run_id(conn, writer), 'writer_session_id': 'fixture-worker:'+writer}, 'worker_session_id': 'fixture-reviewer:'+task}
     if bad == 'event_missing':
         conn.execute("DELETE FROM task_events WHERE task_id=? AND run_id=? AND kind='factory_review_bound'", (task, run_id)); conn.commit()
@@ -169,6 +177,7 @@ def test_review_completion_accepts_exact_frozen_binding(board, monkeypatch):
     task, writer, repo, sha = bound_review(board, monkeypatch)
     assert tick(conn)[1] == [task]
     run_id = kb._current_run_id(conn, task)
+    bind_review_fixture(conn, task)
     metadata = {'factory_review': {'writer_task_id': writer, 'source_workspace': str(repo.resolve()), 'reviewed_sha': sha, 'read_only': True, 'writer_run_id': writer_run_id(conn, writer), 'writer_session_id': 'fixture-worker:'+writer}, 'worker_session_id': 'fixture-reviewer:'+task}
     assert kb.complete_task(conn, task, result='review accepted', metadata=metadata, expected_run_id=run_id, fire_lifecycle_hook=False)
     assert json.loads(conn.execute('SELECT metadata FROM task_runs WHERE id=?', (run_id,)).fetchone()[0])['factory_review'] == metadata['factory_review']
@@ -188,6 +197,7 @@ def test_worker_identity_rejects_unknown_self_or_changed(board, monkeypatch, bad
     assert tick(conn)[1] == [task]
     run_id = kb._current_run_id(conn, task)
     binding = json.loads(conn.execute('SELECT metadata FROM task_runs WHERE id=?', (run_id,)).fetchone()[0])['factory_review']
+    bind_review_fixture(conn, task)
     metadata = {'factory_review': binding, 'worker_session_id': 'fixture-reviewer:'+task}
     if bad == 'missing': metadata.pop('worker_session_id')
     elif bad == 'blank': metadata['worker_session_id'] = ' '
@@ -210,6 +220,7 @@ def test_same_creator_origin_allows_distinct_worker_sessions(board, monkeypatch)
     bound=json.loads(conn.execute('SELECT metadata FROM task_runs WHERE id=?',(run_id,)).fetchone()[0])['factory_review']
     assert bound['writer_run_id']==writer_run_id(conn,writer)
     assert bound['writer_session_id']=='fixture-worker:'+writer
+    bind_review_fixture(conn,task,'different-executor')
     assert kb.complete_task(conn,task,result='independent verdict',metadata={'factory_review':bound,'worker_session_id':'different-executor'},expected_run_id=run_id,fire_lifecycle_hook=False)
 
 

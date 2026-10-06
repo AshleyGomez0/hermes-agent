@@ -23,6 +23,9 @@ from hermes_cli import kanban_db_workspace as kbw
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     """Isolated HERMES_HOME with an empty kanban DB."""
+    # Fake Popen instances must not enter the next test's reclaim sweep.
+    monkeypatch.setattr(kbd, "_live_worker_procs", {})
+    monkeypatch.setattr(kbd, "_recent_worker_exits", {})
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -562,6 +565,9 @@ def test_infrastructure_spawn_refusal_never_charges_the_card(
     failure on the same card still counts."""
     import tools.process_registry as process_registry
 
+    # This test simulates a systemd placement refusal, even on Windows.
+    monkeypatch.setattr(process_registry, "_IS_LINUX", True)
+    monkeypatch.setattr(process_registry.os, "getuid", lambda: 1000, raising=False)
     monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
     monkeypatch.setenv("INVOCATION_ID", "managed-gateway")
     monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: False)
@@ -801,7 +807,7 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
         capture_output=True,
         text=True,
     ).stdout
-    assert f"worktree {target}" in listed
+    assert f"worktree {target.as_posix()}" in listed.replace(chr(92), "/")
     assert f"branch refs/heads/{branch}" in listed
 
 
@@ -1575,7 +1581,7 @@ def test_connect_heals_reduced_tasks_schema_seeded_by_external_harness(kanban_ho
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
+def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch, tmp_path):
     """A `hermes` on PATH must not shadow the running install (#111569):
     the module argv wins whenever ``hermes_cli`` is importable; only an
     explicit ``$HERMES_BIN`` overrides it."""
@@ -1588,8 +1594,9 @@ def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
     monkeypatch.setattr(kbd, "_safe_which_no_cwd", lambda name: "/tmp/planted/hermes")
     assert kbd._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
 
-    monkeypatch.setenv("HERMES_BIN", "/opt/hermes/bin/hermes")
-    assert kbd._resolve_hermes_argv() == ["/opt/hermes/bin/hermes"]
+    explicit_bin = str(tmp_path / "bin" / "hermes")
+    monkeypatch.setenv("HERMES_BIN", explicit_bin)
+    assert kbd._resolve_hermes_argv() == [explicit_bin]
 
 
 
