@@ -2065,17 +2065,23 @@ def dispatch_once(
     return result
 
 
-def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -> Optional[int]:
-    """Back-compat: older spawn_fn signatures (and test stubs) accept only
-    ``(task, workspace)``; pass ``board`` only when the callable supports it."""
+def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str], *, factory_admitted: bool = False) -> Optional[int]:
+    """Carry admission to supporting spawners without breaking older signatures.
+
+    Inspect before invoking: a TypeError raised by the actual spawn must never
+    be caught as a signature error and accidentally launch a second process.
+    """
     import inspect
     try:
-        sig = inspect.signature(spawn_fn)
-        if "board" in sig.parameters:
-            return spawn_fn(task, workspace, board=board)
-        return spawn_fn(task, workspace)
+        parameters = inspect.signature(spawn_fn).parameters
     except (TypeError, ValueError):
-        return spawn_fn(task, workspace)
+        parameters = {}
+    kwargs = {}
+    if 'board' in parameters:
+        kwargs['board'] = board
+    if 'factory_admitted' in parameters:
+        kwargs['factory_admitted'] = factory_admitted
+    return spawn_fn(task, workspace, **kwargs)
 
 
 def _factory_control_scope_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
@@ -2094,7 +2100,7 @@ def _factory_control_scope_guard(conn: sqlite3.Connection, task_id: str) -> Opti
     try:
         if not selector.strip():
             raise ValueError('empty control scope selector')
-        data = json.loads(Path(selector).read_text(encoding='utf-8'))
+        data = json.loads(Path(selector).read_text(encoding='utf-8-sig'))
         if not isinstance(data, dict) or type(data.get('schema_version')) is not int or data['schema_version'] != 1:
             raise ValueError('expected control schema_version=1')
         owner, board_db = data.get('owner_home'), data.get('board_db')
@@ -2125,7 +2131,7 @@ def _factory_policy_guard(conn: sqlite3.Connection, task_id: str, context=None) 
         path = Path(explicit)
         if not path.exists():
             return None  # missing policy preserves the legacy dispatch path
-        policy = json.loads(path.read_text(encoding="utf-8"))
+        policy = json.loads(path.read_text(encoding="utf-8-sig"))
         if not isinstance(policy, dict) or type(policy.get("schema_version")) is not int or policy["schema_version"] != 1:
             raise ValueError("expected schema_version=1")
         if type(policy.get("enabled")) is not bool:
@@ -2346,7 +2352,7 @@ def _dispatch_lane_task(
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     try:
-        pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
+        pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board, factory_admitted=bool(factory_context))
         if pid:
             _set_worker_pid(conn, claimed.id, int(pid))
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
@@ -3112,7 +3118,7 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
     ).argv
 
 
-def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
+def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None, factory_admitted: bool = False) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
     Returns the child's PID so the dispatcher can detect crashes before the
@@ -3169,6 +3175,13 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         strip_launch_profile_env(env, profile_home)
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
+    # Internal per-run provenance, never inherited configuration. This lets a
+    # newly admitted Factory worker fail closed even if its board is unreadable.
+    env.pop("HERMES_KANBAN_FACTORY_RUN", None)
+    if factory_admitted:
+        if type(task.current_run_id) is not int or task.current_run_id <= 0:
+            raise ValueError("Factory spawn requires the exact claimed run")
+        env["HERMES_KANBAN_FACTORY_RUN"] = f"{task.id}:{task.current_run_id}"
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
     # Tag the session `kanban` so session-browsing surfaces filter it out by

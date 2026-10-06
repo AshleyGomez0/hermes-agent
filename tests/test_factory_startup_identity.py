@@ -84,3 +84,48 @@ def test_registration30_error_uses_durable_admission(board, monkeypatch, kind):
     monkeypatch.setattr(dispatch, 'adopt_worker_pid', unavailable)
     assert kt.register_current_worker_from_env(worker_session_id='native-worker-origin') is (not is_factory)
     assert kb.get_task(conn, task).status == 'running'
+
+
+@pytest.mark.parametrize('admitted', [False, True])
+def test_admission33_board_unreadable_is_not_inherited_policy(board, monkeypatch, admitted):
+    conn, home, root = board
+    task = card(conn)
+    assert kb.claim_task(conn, task)
+    run = kb._current_run_id(conn, task)
+    monkeypatch.setenv('HERMES_KANBAN_TASK', task)
+    monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(run))
+    monkeypatch.setenv('HERMES_FACTORY_ROUTING_POLICY', str(root/'missing.json'))
+    if admitted:
+        monkeypatch.setenv('HERMES_KANBAN_FACTORY_RUN', f'{task}:{run}')
+    else:
+        monkeypatch.delenv('HERMES_KANBAN_FACTORY_RUN', raising=False)
+    def unavailable(*args, **kwargs):
+        raise sqlite3.OperationalError('board unavailable before admission read')
+    monkeypatch.setattr(kt, '_board', unavailable)
+    assert kt.register_current_worker_from_env(worker_session_id='native-origin') is (not admitted)
+
+
+def test_admission33_metadata_loss_stops_reviewer_after_successful_adoption(board, monkeypatch):
+    conn, home, root = board
+    task, writer, repo, sha = bound_review(board, monkeypatch)
+    assert dispatch.dispatch_once(conn, spawn_fn=lambda *a: None).spawned
+    run = kb._current_run_id(conn, task)
+    dispatch._set_worker_pid(conn, task, os.getpid())
+    conn.execute('UPDATE task_runs SET metadata=? WHERE id=?', ('{}', run));conn.commit()
+    monkeypatch.setenv('HERMES_KANBAN_TASK', task)
+    monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(run))
+    monkeypatch.setenv('HERMES_KANBAN_DB', str(kb.kanban_db_path()))
+    assert kb.bind_factory_worker_identity(conn, task, run, 'native-origin') is False
+    assert kt.register_current_worker_from_env(worker_session_id='native-origin') is False
+    assert conn.execute("SELECT COUNT(*) FROM task_events WHERE run_id=? AND kind='factory_worker_started'", (run,)).fetchone()[0] == 0
+
+
+def test_admission33_dispatch_carries_factory_admission_once(board, monkeypatch):
+    conn, home, root = board
+    task = card(conn)
+    policy(board, monkeypatch, task_roles={task: 'writer'})
+    calls = []
+    def spawned(task, workspace, *, board=None, factory_admitted=False):
+        calls.append(factory_admitted)
+    assert dispatch.dispatch_once(conn, spawn_fn=spawned).spawned
+    assert calls == [True]

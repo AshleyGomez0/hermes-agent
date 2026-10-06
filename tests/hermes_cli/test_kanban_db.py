@@ -2091,3 +2091,34 @@ def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
             (t,),
         ).fetchone()
         assert row is None
+
+
+@pytest.mark.parametrize("admitted", [False, True])
+def test_factory_spawn_marker_is_owned_by_exact_dispatch_run(tmp_path, monkeypatch, admitted):
+    """Run the real child-env builder; only process creation is replaced."""
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    workspace.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_FACTORY_RUN", "inherited-parent:987")
+    monkeypatch.setattr(kbd, "_live_worker_procs", {})
+    captured = []
+    class Child:
+        pid = 4242
+        def __init__(self, command, **kwargs):
+            captured.append(kwargs["env"])
+    monkeypatch.setattr(subprocess, "Popen", Child)
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: [sys.executable, "-m", "hermes_cli.main"])
+    task = kb.Task(
+        id="t_marker", title="fixture", body=None, assignee="coder", status="running",
+        priority=0, created_by=None, created_at=0, started_at=None, completed_at=None,
+        workspace_kind="dir", workspace_path=str(workspace), claim_lock=None,
+        claim_expires=None, tenant=None, branch_name=None, current_run_id=7,
+    )
+    kbd._default_spawn(task, str(workspace), factory_admitted=admitted)
+    assert len(captured) == 1
+    assert captured[0].get("HERMES_KANBAN_FACTORY_RUN") == ("t_marker:7" if admitted else None)
+    assert captured[0]["HERMES_KANBAN_RUN_ID"] == "7"

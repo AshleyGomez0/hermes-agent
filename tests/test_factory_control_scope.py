@@ -242,3 +242,15 @@ def test_worker_session_stamp_rejects_forged_metadata(monkeypatch):
     monkeypatch.delenv('HERMES_SESSION_ID')
     assert _stamp_worker_session_metadata('own-task',original)=={'field':'keep'}
     assert original['worker_session_id']=='forged'
+
+
+@pytest.mark.parametrize('target', ['scope', 'routing'])
+def test_bom33_windows_json_preserves_admission(board, monkeypatch, target):
+    conn, home, root = board
+    task = card(conn)
+    control = scope(board, monkeypatch, task_ids=[task])
+    routing = policy(board, monkeypatch, task_roles={task: 'writer'})
+    path = control if target == 'scope' else routing
+    path.write_bytes(b'\xef\xbb\xbf' + path.read_bytes())
+    result, calls = tick(conn)
+    assert calls == [task]

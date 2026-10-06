@@ -2780,7 +2780,7 @@ def _factory_writer_snapshot(conn, reviewer_id, writer_id, reviewed_sha, *, comp
         if not path.is_dir() or writer.workspace_kind not in ('dir', 'worktree'):
             return None
         def git(*args):
-            return subprocess.run(['git', '-C', str(path), *args], capture_output=True, text=True, timeout=5, check=True).stdout.strip()
+            return subprocess.run(['git', '-C', str(path), *args], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5, check=True).stdout.strip()
         if Path(git('rev-parse', '--show-toplevel')).resolve() != path:
             return None
         if git('rev-parse', '--verify', 'HEAD^{commit}') != reviewed_sha:
@@ -2811,8 +2811,19 @@ def bind_factory_worker_identity(conn, task_id, expected_run_id, worker_session_
             saved = json.loads(row['metadata'] or '{}')
             if not isinstance(saved, dict):
                 return False
-            if 'factory_review' not in saved:
+            reviews = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+                "AND kind='factory_review_bound' ORDER BY id", (task_id, expected_run_id)).fetchall()
+            capacity = saved.get('factory_capacity')
+            review_expected = bool(reviews or 'factory_review' in saved or (
+                isinstance(capacity, dict) and capacity.get('role') == 'independent_reviewer'))
+            if not review_expected:
                 return True
+            if len(reviews) != 1:
+                return False
+            bound = json.loads(reviews[0]['payload'])
+            if not isinstance(bound, dict) or not bound or saved.get('factory_review') != bound:
+                return False
             pid = os.getpid()
             fingerprint = dispatch._process_fingerprint(pid)
             if (row['status'] != 'running' or row['current_run_id'] != expected_run_id

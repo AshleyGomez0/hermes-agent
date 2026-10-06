@@ -7,7 +7,7 @@ from test_provider_capacity_dispatch import board,policy,card
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as dispatch
 
-pytestmark=pytest.mark.skipif(os.name!='nt',reason='Windows handle backend')
+pytestmark = pytest.mark.platforms("windows")
 
 def child(registry,scope,hold=0):
     import hermes_cli.factory_workspace_lease as m

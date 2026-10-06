@@ -599,8 +599,10 @@ def register_current_worker_from_env(*, worker_session_id: Optional[str] = None)
     key = (os.getpid(), tid, run_id)
     if key in _worker_run_session_ids and _worker_run_session_ids[key] != session_id:
         return False
-    # Unknown explicit Factory contexts stay closed until admission is readable.
-    factory_required = bool(os.environ.get("HERMES_FACTORY_ROUTING_POLICY"))
+    # Only the dispatcher-owned run marker proves admission before the DB can
+    # be read. A missing/disabled inherited policy is not Factory admission.
+    spawn_admitted = os.environ.get("HERMES_KANBAN_FACTORY_RUN") == f"{tid}:{run_id}"
+    factory_required = spawn_admitted
     try:
         import json
         from hermes_cli import kanban_db_dispatch as kbd
@@ -616,7 +618,17 @@ def register_current_worker_from_env(*, worker_session_id: Optional[str] = None)
             saved = json.loads(row['metadata'] or '{}')
             if not isinstance(saved, dict):
                 return False
-            factory_required = bool(row['factory_bound'] or 'factory_capacity' in saved or 'factory_review' in saved)
+            factory_required = bool(spawn_admitted or row['factory_bound'] or 'factory_capacity' in saved or 'factory_review' in saved)
+            if factory_required:
+                permits = conn.execute(
+                    "SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+                    "AND kind='factory_capacity_permit' ORDER BY id", (tid, run_id)).fetchall()
+                if len(permits) != 1:
+                    return False
+                permit = json.loads(permits[0]['payload'])
+                if (not isinstance(permit, dict) or not permit
+                        or saved.get('factory_capacity') != permit):
+                    return False
             if not kbd.adopt_worker_pid(conn, tid, run_id, os.getpid()):
                 return False
             if not _kb.bind_factory_worker_identity(conn, tid, run_id, session_id):
