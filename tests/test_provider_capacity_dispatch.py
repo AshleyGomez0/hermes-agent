@@ -49,6 +49,25 @@ def card(conn, provider='openai-codex', model='gpt-6.1-sol'):
     return task
 
 
+def completed_writer_contract(board):
+    """Real committed, clean fixture writer for positive independent-review tests."""
+    import subprocess
+    import tempfile
+    conn, home, root = board
+    repo = Path(tempfile.mkdtemp(prefix='review-writer-', dir=root))
+    def git(*args):
+        return subprocess.check_output(['git', '-C', str(repo), *args],
+                                       text=True, timeout=15).strip()
+    git('-c', 'init.defaultBranch=main', 'init')
+    git('-c', 'user.name=Offline', '-c', 'user.email=offline@example.invalid',
+        'commit', '--allow-empty', '-m', 'independent review fixture')
+    writer = card(conn)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='done',workspace_kind='dir',workspace_path=? WHERE id=?", (str(repo), writer))
+    return {'role': 'independent_reviewer', 'writer_task_id': writer,
+            'reviewed_sha': git('rev-parse', 'HEAD')}
+
+
 def tick(conn):
     # Declared UNIT fixture: no model request, subprocess or live runtime.
     calls = []
@@ -117,7 +136,7 @@ def test_explicit_roles_dispatch_and_persist_permit(board, monkeypatch, lane, ro
     with kb.write_txn(conn):
         conn.execute('UPDATE tasks SET status=? WHERE id=?', (lane, task))
     monkeypatch.setattr(dispatch, 'review_dispatch_enabled', lambda: True)
-    contract = {'role': role, 'writer_task_id': 'different-task', 'reviewed_sha': 'a' * 40}
+    contract = completed_writer_contract(board) if role == 'independent_reviewer' else {'role': role}
     policy(board, monkeypatch, task_roles={task: contract}, routes={
         'codex': {'profile': 'codex-worker', 'provider': 'openai-codex', 'model': 'gpt-6.1-sol',
                   'eligible_roles': ['writer', 'read_only', 'test_fix', 'independent_reviewer']},
@@ -208,7 +227,7 @@ def test_halfopen_single_permit_and_recovered_success_cannot_clear_new_open(boar
     from hermes_cli.provider_capacity import CapacityBreaker
     conn, home, tmp_path = board
     a, b = card(conn), card(conn)
-    contracts = {t: {'role': 'independent_reviewer' if lane == 'review' else 'writer', 'writer_task_id': 'other', 'reviewed_sha': 'a'*40} for t in (a,b)}
+    contracts = {t: completed_writer_contract(board) if lane == 'review' else {'role': 'writer'} for t in (a,b)}
     policy(board, monkeypatch, task_roles=contracts)
     monkeypatch.setattr(dispatch, 'review_dispatch_enabled', lambda: True)
     monkeypatch.setattr(dispatch, 'check_respawn_guard', lambda *a, **k: None)
@@ -256,8 +275,8 @@ def test_synchronous_spawn_http429_is_failure_neutral(board, monkeypatch, lane, 
     import sqlite3
     conn, home, tmp_path = board
     task = card(conn)
-    policy(board, monkeypatch, task_roles={task: {'role': 'independent_reviewer' if lane == 'review' else 'writer',
-           'writer_task_id': 'other', 'reviewed_sha': 'a' * 40}})
+    contract = completed_writer_contract(board) if lane == 'review' else {'role': 'writer'}
+    policy(board, monkeypatch, task_roles={task: contract})
     monkeypatch.setattr(dispatch, 'review_dispatch_enabled', lambda: True)
     with kb.write_txn(conn):
         conn.execute('UPDATE tasks SET status=? WHERE id=?', (lane, task))

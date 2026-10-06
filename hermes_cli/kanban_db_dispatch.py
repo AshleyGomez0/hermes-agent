@@ -2070,10 +2070,46 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
+def _factory_control_scope_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Independent opt-in admission; routing disabled/missing cannot bypass it.
+
+    The trusted runtime home is the owner boundary, not arbitrary absolute syntax.
+    No selector preserves legacy non-Factory dispatch. A selected broken guard
+    denies admission; it is never silently treated as disabled.
+    """
+    import json
+    from hermes_constants import get_hermes_home
+
+    selector = os.environ.get('HERMES_FACTORY_CONTROL_SCOPE_FILE')
+    if selector is None:
+        return None
+    try:
+        if not selector.strip():
+            raise ValueError('empty control scope selector')
+        data = json.loads(Path(selector).read_text(encoding='utf-8'))
+        if not isinstance(data, dict) or type(data.get('schema_version')) is not int or data['schema_version'] != 1:
+            raise ValueError('expected control schema_version=1')
+        owner, board_db = data.get('owner_home'), data.get('board_db')
+        if not isinstance(owner, str) or not Path(owner).is_absolute() or Path(owner).resolve() != Path(get_hermes_home()).resolve():
+            raise ValueError('control owner differs from effective runtime home')
+        actual = next((r[2] for r in conn.execute('PRAGMA database_list') if r[1] == 'main'), '')
+        if not isinstance(board_db, str) or not Path(board_db).is_absolute() or not actual or Path(board_db).resolve() != Path(actual).resolve():
+            raise ValueError('control board differs from connected board')
+        ids = data.get('task_ids')
+        if not isinstance(ids, list) or any(not isinstance(i, str) or not i.strip() for i in ids):
+            raise ValueError('explicit task_ids required')
+        return None if task_id in ids else 'factory_control_task_denied'
+    except (OSError, ValueError, TypeError, AttributeError, sqlite3.Error):
+        return 'factory_control_scope_invalid'
+
+
 def _factory_policy_guard(conn: sqlite3.Connection, task_id: str, context=None) -> Optional[str]:
     """Validate explicit task contracts without mutating assignments or ledger."""
     import json
 
+    control_reason = _factory_control_scope_guard(conn, task_id)
+    if control_reason is not None:
+        return control_reason
     explicit = os.environ.get("HERMES_FACTORY_ROUTING_POLICY", "")
     if not explicit:
         return None
@@ -2131,6 +2167,11 @@ def _factory_policy_guard(conn: sqlite3.Connection, task_id: str, context=None) 
             sha = contract.get('reviewed_sha')
             if not isinstance(writer, str) or not writer.strip() or writer == task_id or not isinstance(sha, str) or re.fullmatch(r'[0-9a-fA-F]{40}', sha) is None:
                 return 'factory_invalid_review_contract'
+            binding = _kb._factory_writer_snapshot(conn, task_id, writer, sha)
+            if binding is None:
+                return 'factory_invalid_review_contract'
+            if context is not None:
+                context['factory_review'] = binding
         phase = conn.execute('SELECT status FROM tasks WHERE id=?', (task_id,)).fetchone()
         if phase is not None and phase['status'] == 'review' and role != 'independent_reviewer':
             return 'factory_invalid_review_contract'
@@ -2260,7 +2301,11 @@ def _dispatch_lane_task(
     if factory_context:
         with _kb.write_txn(conn):
             run_id = _kb._current_run_id(conn, task_id)
-            conn.execute('UPDATE task_runs SET metadata=? WHERE id=?', (_kb._json_or_null({'factory_capacity': factory_context}), run_id))
+            run_metadata = {'factory_capacity': factory_context}
+            if factory_context.get('factory_review'):
+                run_metadata['factory_review'] = factory_context['factory_review']
+                _kb._append_event(conn, task_id, 'factory_review_bound', factory_context['factory_review'], run_id=run_id)
+            conn.execute('UPDATE task_runs SET metadata=? WHERE id=?', (_kb._json_or_null(run_metadata), run_id))
             # Terminal helpers replace metadata; retain permit as a run-keyed event.
             _kb._append_event(conn, task_id, 'factory_capacity_permit', factory_context, run_id=run_id)
         if factory_context.get('probe_token') and not CapacityBreaker(factory_context['ledger'], enabled=True).bind_probe(
@@ -2306,16 +2351,17 @@ def _dispatch_lane_task(
     except Exception as exc:
         response = getattr(exc, 'response', None)
         status = getattr(exc, 'status_code', None) or getattr(response, 'status_code', None) or getattr(exc, 'code', None)
-        if status == 429:
+        if status in (402, 429):
             from hermes_cli.provider_capacity import CapacityBreaker
             if factory_context and not CapacityBreaker(factory_context['ledger'], enabled=True).rate_limited(
                     factory_context['owner'], factory_context['provider'], now=time.time(), board=factory_context['board'], reset_at=_factory_reset_at(exc)):
                 return False  # keep the claim until OPEN can be persisted
-            error = f'HTTP 429 quota wall: {exc}'
+            reason = 'billing' if status == 402 else 'quota'
+            error = f'HTTP {status} {reason} wall: {exc}'
             with _kb.write_txn(conn):
                 conn.execute("UPDATE tasks SET status=?,claim_lock=NULL,claim_expires=NULL,worker_pid=NULL,worker_started_at=NULL,last_failure_error=? WHERE id=?", (lane, error[:500], claimed.id))
                 run_id = _kb._end_run(conn, claimed.id, outcome='rate_limited', status='rate_limited', error=error)
-                _kb._append_event(conn, claimed.id, 'rate_limited', {'status_code': 429, 'retry_status': lane}, run_id=run_id)
+                _kb._append_event(conn, claimed.id, 'rate_limited', {'status_code': status, 'reason': reason, 'retry_status': lane}, run_id=run_id)
             result.rate_limited.append(claimed.id)
             return False
         from tools.process_registry import RestartSafeScopeUnavailable

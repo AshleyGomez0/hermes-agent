@@ -2728,6 +2728,78 @@ def _claim_is_live(trow) -> bool:
     )
 
 
+def _factory_writer_snapshot(conn, reviewer_id, writer_id, reviewed_sha, *, completing=False):
+    """Bind a distinct completed writer to its real committed Git workspace."""
+    import re
+    import subprocess
+    if writer_id == reviewer_id or not isinstance(reviewed_sha, str) or re.fullmatch(r'[0-9a-f]{40}', reviewed_sha) is None:
+        return None
+    writer = get_task(conn, writer_id)
+    reviewer = get_task(conn, reviewer_id)
+    # claim_review_task moves review -> running. Completion validates that live
+    # review run; admission still requires the pre-claim review phase.
+    expected_phase = 'running' if completing else 'review'
+    if writer is None or writer.status != 'done' or reviewer is None or reviewer.status != expected_phase:
+        return None
+    if writer.session_id and writer.session_id == reviewer.session_id:
+        return None
+    try:
+        path = Path(writer.workspace_path).resolve(strict=True)
+        if not path.is_dir() or writer.workspace_kind not in ('dir', 'worktree'):
+            return None
+        def git(*args):
+            return subprocess.run(['git', '-C', str(path), *args], capture_output=True, text=True, timeout=5, check=True).stdout.strip()
+        if Path(git('rev-parse', '--show-toplevel')).resolve() != path:
+            return None
+        if git('rev-parse', '--verify', 'HEAD^{commit}') != reviewed_sha:
+            return None
+        if git('status', '--porcelain', '--untracked-files=all'):
+            return None
+        return {'writer_task_id': writer_id, 'source_workspace': str(path), 'reviewed_sha': reviewed_sha, 'read_only': True}
+    except (OSError, TypeError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _factory_review_completion_valid(conn, task_id, expected_run_id, metadata):
+    """Accept an opted-in Factory review only against its immutable dispatch event.
+
+    Legacy non-Factory completions keep their existing contract. A bound review
+    must echo its exact contract, retain the dispatch metadata, and still name
+    a distinct completed writer at the clean committed source SHA.
+    """
+    import json
+    try:
+        run_id = _current_run_id(conn, task_id)
+        if run_id is None:
+            return not (isinstance(metadata, dict) and 'factory_review' in metadata)
+        events = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+            "AND kind='factory_review_bound' ORDER BY id", (task_id, run_id)).fetchall()
+        row = conn.execute('SELECT metadata FROM task_runs WHERE id=? AND task_id=?',
+                           (run_id, task_id)).fetchone()
+        saved = json.loads(row['metadata'] or '{}') if row is not None else {}
+        saved_has_review = isinstance(saved, dict) and (
+            'factory_review' in saved or isinstance(saved.get('factory_capacity'), dict)
+            and 'factory_review' in saved['factory_capacity'])
+        incoming_has_review = isinstance(metadata, dict) and 'factory_review' in metadata
+        if not events:
+            return not saved_has_review and not incoming_has_review
+        if len(events) != 1 or expected_run_id is None or int(expected_run_id) != run_id:
+            return False
+        bound = json.loads(events[0]['payload'])
+        keys = {'writer_task_id', 'source_workspace', 'reviewed_sha', 'read_only'}
+        if not isinstance(bound, dict) or set(bound) != keys or bound['read_only'] is not True:
+            return False
+        if not isinstance(saved, dict) or saved.get('factory_review') != bound:
+            return False
+        if not isinstance(metadata, dict) or metadata.get('factory_review') != bound:
+            return False
+        actual = _factory_writer_snapshot(conn, task_id, bound['writer_task_id'], bound['reviewed_sha'], completing=True)
+        return actual == bound
+    except (ValueError, TypeError, KeyError, AttributeError, sqlite3.Error):
+        return False
+
+
 def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
@@ -2755,6 +2827,8 @@ def complete_task(
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
+    if not _factory_review_completion_valid(conn, task_id, expected_run_id, metadata):
+        return False
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
@@ -2769,6 +2843,8 @@ def complete_task(
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
+            return False
+        if not _factory_review_completion_valid(conn, task_id, expected_run_id, metadata):
             return False
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
@@ -4000,6 +4076,9 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     now = int(time.time())
     lines: list[str] = []
     _ctx_header(lines, task)
+    review = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='factory_review_bound' ORDER BY id LIMIT 1", (task_id, task.current_run_id)).fetchone()
+    if review:
+        lines.extend(['', '## Factory independent review — READ_ONLY', review['payload'], 'Do not modify the source workspace. Return metadata.factory_review exactly; this is a distinct task/run/session.'])
     _ctx_attachments(lines, list_attachments(conn, task_id))
     _ctx_prior_attempts(lines, conn, task_id, now)
     _ctx_parent_results(lines, conn, task_id, now)
