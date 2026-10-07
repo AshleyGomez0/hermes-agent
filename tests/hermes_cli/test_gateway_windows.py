@@ -919,6 +919,26 @@ def test_installed_task_start_reenters_the_external_supervisor(monkeypatch):
     assert calls == [["/Run", "/TN", "Hermes_Gateway"], "Scheduled Task supervisor"]
 
 
+def test_install_start_now_reenters_the_new_scheduled_task(monkeypatch, tmp_path):
+    """Install-time starts must not orphan a direct child beside the Task."""
+    calls = []
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(gateway_windows, "_prompt_install_choices", lambda *_a: (True, True))
+    monkeypatch.setattr(gateway_windows, "get_task_name", lambda: "Hermes_Gateway")
+    monkeypatch.setattr(gateway_windows, "_write_task_script", lambda: tmp_path / "gateway.cmd")
+    monkeypatch.setattr(gateway_windows, "_startup_staging_path", lambda: tmp_path / "gateway.tmp")
+    monkeypatch.setattr(gateway_windows, "_is_running_as_admin", lambda: True)
+    monkeypatch.setattr(gateway_windows, "_install_scheduled_task", lambda *_a: (True, "created"))
+    monkeypatch.setattr(gateway_windows, "_remove_startup_entries", lambda: ([], []))
+    monkeypatch.setattr(gateway_windows, "_print_next_steps", lambda: None)
+    monkeypatch.setattr(gateway_windows, "start", lambda: calls.append("task"))
+    monkeypatch.setattr(gateway_windows, "_start_or_report_running", lambda: pytest.fail("must not direct-spawn"))
+
+    gateway_windows.install(start_now=True, start_on_login=True)
+
+    assert calls == ["task"]
+
+
 def test_supervisor_launcher_path_does_not_overwrite_legacy_vbs(monkeypatch, tmp_path):
     """The new restart policy is staged at a new path so a denied task update
     cannot change what the still-registered legacy task executes."""
@@ -1013,8 +1033,8 @@ def test_start_without_tty_starts_the_gateway_but_never_installs_login_persisten
 
 
 def test_start_on_tty_hands_both_answers_to_install_and_honours_the_env_opt_out(monkeypatch):
-    """Yes → one install() carrying start_now+start_on_login (install spawns; start() must not spawn
-    again). HERMES_GATEWAY_INSTALL_START_ON_LOGIN=0 → no question, no install, a plain start."""
+    """Yes → one install() carrying start_now+start_on_login (install starts through its Task; start()
+    must not start again). HERMES_GATEWAY_INSTALL_START_ON_LOGIN=0 → no question, no install, a plain start."""
     installs, spawns = _arrange_uninstalled_start(monkeypatch)
     monkeypatch.setattr(setup, "is_interactive_stdin", lambda: True)
     monkeypatch.setattr(setup, "prompt_yes_no", lambda *a, **k: True)

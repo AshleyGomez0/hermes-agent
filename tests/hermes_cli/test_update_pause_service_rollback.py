@@ -102,6 +102,23 @@ def test_update_pauses_every_profile_supervisor_before_stopping_the_host_fleet(m
     assert token["supervisor_paused_profiles"] == {"default": str(default_home), "sibling": str(sibling_home)}
 
 
+def test_update_does_not_arm_a_supervisor_before_its_pause_is_durable(monkeypatch, tmp_path):
+    """A record-write abort cannot leave a one-shot Task stop marker stranded."""
+    from hermes_cli import main
+
+    home = tmp_path / "default"
+    home.mkdir()
+    process = SimpleNamespace(pid=101, profile="default", path=home, create_time=1.0)
+    monkeypatch.setattr(main, "_is_windows", lambda: True)
+    monkeypatch.setattr(update_cmd_windows, "_discover_windows_gateways", lambda: ({101: process}, [], set(), [101]))
+    monkeypatch.setattr(update_cmd_windows, "_windows_supervisor_profile_homes", lambda *_a: {"default": str(home)})
+    monkeypatch.setattr(pause_record, "record_pause", lambda *_a: (_ for _ in ()).throw(OSError("disk full")))
+    monkeypatch.setattr(gateway_windows, "pause_supervisor_for_update", lambda: pytest.fail("marker armed before record"))
+
+    with pytest.raises(RuntimeError, match="Could not record"):
+        _pause_windows_gateways_for_update()
+
+
 def test_update_pauses_a_retrying_supervisor_even_when_its_child_is_absent(monkeypatch, tmp_path):
     """The retry-delay window is live ownership, not a cold-start case."""
     from hermes_cli import main, profiles
@@ -130,6 +147,7 @@ def test_update_resume_restarts_a_paused_supervisor_through_its_task(monkeypatch
     started = []
     monkeypatch.setattr(main, "_refresh_windows_gateway_launchers", lambda: None)
     monkeypatch.setattr(gateway_windows, "start", lambda: started.append("task"))
+    monkeypatch.setattr(gateway_windows, "_wait_for_gateway_ready", lambda **_k: [20])
     monkeypatch.setattr(
         update_cmd_windows, "_relaunch_paused_gateways",
         lambda *_a: pytest.fail("must not replay a direct child beside supervisor"),
@@ -141,3 +159,21 @@ def test_update_resume_restarts_a_paused_supervisor_through_its_task(monkeypatch
     assert started == ["task"]
     assert token["supervisor_paused"] is False
     assert token["profiles"] == {}
+
+
+def test_update_resume_keeps_supervisor_debt_when_task_child_never_becomes_ready(monkeypatch):
+    """A successful schtasks request is not a restart until its gateway survives readiness."""
+    from hermes_cli import main
+
+    monkeypatch.setattr(main, "_refresh_windows_gateway_launchers", lambda: None)
+    monkeypatch.setattr(gateway_windows, "start", lambda: None)
+    monkeypatch.setattr(gateway_windows, "_wait_for_gateway_ready", lambda **_k: [])
+
+    token = {"resume_needed": True, "supervisor_paused_profiles": {"default": "C:/home"},
+             "profiles": {"default": 10}, "unmapped": []}
+    with pytest.raises(RuntimeError, match="did not become ready"):
+        update_cmd_windows._resume_paused_set(token)
+
+    assert token["resume_needed"] is True
+    assert token["supervisor_paused_profiles"] == {"default": "C:/home"}
+    assert token["profiles"] == {"default": 10}

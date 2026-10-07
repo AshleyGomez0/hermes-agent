@@ -1,8 +1,8 @@
 """Windows gateway service backend (Scheduled Task + Startup-folder fallback).
 
 Mirrors the ``launchd_*`` / ``systemd_*`` contract. ``schtasks /Create ... /RL LIMITED`` runs at the
-CURRENT USER's next logon without elevation. Manual starts and ``install --start-now`` use the direct
-hidden-console launcher instead of ``schtasks /Run`` so start/restart behavior is consistent.
+CURRENT USER's next logon without elevation. An installed Task owns its gateway lifecycle; manual
+starts without one retain the direct hidden-console launcher.
 """
 
 from __future__ import annotations
@@ -724,7 +724,6 @@ def _install_scheduled_task(task_name: str, script_path: Path) -> tuple[bool, st
     launcher_path = _supervisor_launcher_path(script_path)
     xml_path = launcher_path.with_suffix(".task.xml")
     xml_path.write_text(_build_scheduled_task_xml(task_name, launcher_path, user), encoding="utf-16", newline="")
-    # Immediate manual starts use _spawn_detached(). See #45599.
     base = ["/Create", "/F", "/TN", task_name, "/XML", str(xml_path)]
     variants = [[*base, "/RU", user, "/NP", "/IT"], base] if user else [base]
     last_code, last_err = 1, ""
@@ -1122,7 +1121,9 @@ def install(
         for message in warnings:
             print(f"⚠ {message}")
         if start_now:
-            _start_or_report_running()
+            # The Task's wrapper owns exit-75 recovery. Do not create a direct
+            # child beside it merely because this is the install-time start.
+            start()
         else:
             print("ℹ Gateway not started now.")
             print("  Start manually with: hermes gateway start")
