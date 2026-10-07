@@ -69,7 +69,58 @@ def test_update_pause_stops_supervisor_before_force_stopping_its_child(monkeypat
     token = _pause_windows_gateways_for_update()
 
     assert order == ["arm-stop", "force-child", ("ack-stop", "nonce")]
-    assert token["supervisor_paused"] is True
+    assert token["supervisor_paused_profiles"] == {"default": os.environ["HERMES_HOME"]}
+
+
+def test_update_pauses_every_profile_supervisor_before_stopping_the_host_fleet(monkeypatch, tmp_path):
+    """A sibling Task must not respawn its force-stopped child during a host-wide update."""
+    from hermes_cli import main, profiles
+    from hermes_constants import get_hermes_home_override
+
+    default_home, sibling_home = tmp_path / "default", tmp_path / "profiles" / "sibling"
+    default_home.mkdir(parents=True)
+    sibling_home.mkdir(parents=True)
+    processes = {
+        101: SimpleNamespace(pid=101, profile="default", path=default_home, create_time=1.0),
+        202: SimpleNamespace(pid=202, profile="sibling", path=sibling_home, create_time=1.0),
+    }
+    calls = []
+    monkeypatch.setattr(main, "_is_windows", lambda: True)
+    monkeypatch.setattr(profiles, "profiles_to_serve", lambda *_a, **_k: [("default", default_home), ("sibling", sibling_home)])
+    monkeypatch.setattr(update_cmd_windows, "_discover_windows_gateways", lambda: (processes, [], set(), [101, 202]))
+    monkeypatch.setattr(update_cmd_windows, "_stop_windows_gateways", lambda *_a, **_k: calls.append("stop") or {"default": 101, "sibling": 202})
+    monkeypatch.setattr(update_cmd_windows, "_record_attested_cold_start_profiles", lambda *_a: None)
+    monkeypatch.setattr(gateway_windows, "pause_supervisor_for_update", lambda: calls.append(("arm", get_hermes_home_override())) or "nonce")
+    monkeypatch.setattr(gateway_windows, "wait_for_supervisor_pause", lambda nonce: calls.append(("ack", get_hermes_home_override(), nonce)))
+
+    token = _pause_windows_gateways_for_update()
+
+    assert calls == [
+        ("arm", str(default_home)), ("arm", str(sibling_home)), "stop",
+        ("ack", str(default_home), "nonce"), ("ack", str(sibling_home), "nonce"),
+    ]
+    assert token["supervisor_paused_profiles"] == {"default": str(default_home), "sibling": str(sibling_home)}
+
+
+def test_update_pauses_a_retrying_supervisor_even_when_its_child_is_absent(monkeypatch, tmp_path):
+    """The retry-delay window is live ownership, not a cold-start case."""
+    from hermes_cli import main, profiles
+    from hermes_constants import get_hermes_home_override
+
+    home = tmp_path / "default"
+    home.mkdir()
+    calls = []
+    monkeypatch.setattr(main, "_is_windows", lambda: True)
+    monkeypatch.setattr(profiles, "profiles_to_serve", lambda *_a, **_k: [("default", home)])
+    monkeypatch.setattr(update_cmd_windows, "_discover_windows_gateways", lambda: ({}, [], set(), []))
+    monkeypatch.setattr(update_cmd_windows, "_cold_start_pause_token", lambda *_a: None)
+    monkeypatch.setattr(gateway_windows, "pause_supervisor_for_update", lambda: calls.append(("arm", get_hermes_home_override())) or "nonce")
+    monkeypatch.setattr(gateway_windows, "wait_for_supervisor_pause", lambda nonce: calls.append(("ack", get_hermes_home_override(), nonce)))
+
+    token = _pause_windows_gateways_for_update()
+
+    assert calls == [("arm", str(home)), ("ack", str(home), "nonce")]
+    assert token["supervisor_paused_profiles"] == {"default": str(home)}
 
 
 def test_update_resume_restarts_a_paused_supervisor_through_its_task(monkeypatch):
