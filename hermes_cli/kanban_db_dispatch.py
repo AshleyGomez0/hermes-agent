@@ -3004,10 +3004,10 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _kb._log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
-def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
+def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str], *, launch_argv=None) -> list[str]:
     """Build the ``hermes -p <profile> --cli ... chat -q ...`` worker command."""
     cmd = [
-        *_resolve_hermes_argv(),
+        *(launch_argv if launch_argv is not None else _resolve_hermes_argv()),
         "-p", profile_arg,
         # A worker must NEVER boot the interactive TUI: its no-TTY bail-out
         # exits 0 without doing the task → "protocol violation" every attempt.
@@ -3151,6 +3151,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None, f
         env["HERMES_TENANT"] = task.tenant
     # Internal per-run provenance, never inherited configuration. This lets a
     # newly admitted Factory worker fail closed even if its board is unreadable.
+    env.pop("_HERMES_FACTORY_WORKER_BOOT", None)
     env.pop("HERMES_KANBAN_FACTORY_RUN", None)
     if factory_admitted:
         if type(task.current_run_id) is not int or task.current_run_id <= 0:
@@ -3208,7 +3209,11 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None, f
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
+    launch_argv = None
+    if factory_admitted and os.name == "nt":
+        from hermes_cli.kanban_worker_process import direct_factory_launch
+        launch_argv = direct_factory_launch(env, Path(__file__).resolve().parents[1])
+    cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"), launch_argv=launch_argv)
     # The module argv must carry the import context that made it resolvable:
     # the shim's in-process path injection is invisible to the bare child.
     _propagate_module_import_root(cmd, env)
