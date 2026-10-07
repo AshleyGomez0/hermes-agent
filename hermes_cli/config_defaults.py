@@ -2162,6 +2162,8 @@ DEFAULT_CONFIG = {
         # Two profiles configuring the same bot token cannot be served together — the duplicate
         # adapter is parked; `hermes profile create --clone` therefore leaves messaging channels
         # behind unless --clone-channels is passed.
+        # Explicit task identity for separate Windows accounts sharing a server.
+        "windows_task_name": None,
         "multiplex_profiles": True,
         # May `hermes update` fold this install onto a multiplexed default gateway by itself?
         # True (the default) keeps today's behaviour: a multi-profile install whose secondaries run
