@@ -1,4 +1,4 @@
-"""A failed service pause keeps its record exactly when its rollback left gateways down.
+﻿"""A failed service pause keeps its record exactly when its rollback left gateways down.
 
 ``_pause_windows_gateways_for_update`` decides whether to abandon the durable pause record from the
 service-pause failure. That decision is read from a typed ``rollback_failures`` list, never from the
