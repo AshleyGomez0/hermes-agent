@@ -3,7 +3,7 @@ from pathlib import Path
 import os,sys,subprocess,json
 import pytest
 from hermes_cli.factory_workspace_lease import acquire_workspace_lease, WorkspaceLeaseUnavailable
-from test_provider_capacity_dispatch import board,policy,card
+from tests.test_provider_capacity_dispatch import board,policy,card
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as dispatch
 

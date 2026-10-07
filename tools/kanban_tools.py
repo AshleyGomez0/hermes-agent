@@ -626,7 +626,11 @@ def register_current_worker_from_env(*, worker_session_id: Optional[str] = None)
                 if len(permits) != 1:
                     return False
                 permit = json.loads(permits[0]['payload'])
-                if (not isinstance(permit, dict) or not permit
+                from pathlib import Path
+                from hermes_cli.factory_contracts import valid_capacity_permit
+                actual_board = next((r[2] for r in conn.execute('PRAGMA database_list') if r[1] == 'main'), '')
+                if (not actual_board or not valid_capacity_permit(permit,
+                        board_path=Path(actual_board).resolve(), reviewer_id=tid)
                         or saved.get('factory_capacity') != permit):
                     return False
             if not kbd.adopt_worker_pid(conn, tid, run_id, os.getpid()):

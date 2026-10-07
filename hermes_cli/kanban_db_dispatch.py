@@ -2193,6 +2193,10 @@ def _factory_policy_guard(conn: sqlite3.Connection, task_id: str, context=None) 
         route = next((r for r in eligible if row is not None and tuple(row) == (r['provider'], r['model'], r['profile']) and role in r['eligible_roles']), None)
         if route is None:
             return 'factory_route_mismatch'
+        if role in ('writer', 'test_fix') and os.name != 'nt':
+            # The current physical lease backend is Windows-only. Defer before
+            # claiming or spawning; never create an infrastructure retry loop.
+            return 'factory_workspace_lease_unsupported_host'
         if context is not None:
             context.update(owner=os.path.normcase(str(Path(owner).resolve())), provider=route['provider'],
                            ledger=str(path.resolve().parent / 'capacity.sqlite'), board=str(Path(board_db).resolve()),

@@ -14,8 +14,8 @@ concurrency:
 jobs:
   test:
     name: Run tests
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 30
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}
+    timeout-minutes: ${{ github.repository == 'NousResearch/hermes-agent' && 30 || 90 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -77,7 +77,7 @@ jobs:
         run: |
           scripts/run_tests.sh
         env:
-          HERMES_TEST_WORKERS: 32
+          HERMES_TEST_WORKERS: ${{ github.repository == 'NousResearch/hermes-agent' && '32' || '4' }}
           HERMES_TEST_FILE_TIMEOUT: 600
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
@@ -96,8 +96,8 @@ jobs:
   e2e:
     # The core suites spawn real serve / gateway / tui_gateway / MCP / SQLite
     # writer processes per test; a 4-vCPU runner serialises them into timeouts.
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 30
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}
+    timeout-minutes: ${{ github.repository == 'NousResearch/hermes-agent' && 30 || 90 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -214,8 +214,8 @@ jobs:
     # runs ~5-15 min. Sharded by suite directory (see e2e-upgrade-plan).
     name: e2e-upgrade (${{ matrix.shard }})
     needs: e2e-upgrade-plan
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 60
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}
+    timeout-minutes: ${{ github.repository == 'NousResearch/hermes-agent' && 60 || 120 }}
     strategy:
       fail-fast: false
       matrix:
@@ -324,7 +324,7 @@ jobs:
           # Each file drives real installs/updaters (process trees plus uv and
           # git I/O); cpu_count of them at once starves their deadlines. A
           # shard holds at most ~7 files, so this runs each shard in one wave.
-          HERMES_TEST_WORKERS: "6"
+          HERMES_TEST_WORKERS: ${{ github.repository == 'NousResearch/hermes-agent' && '6' || '2' }}
           HERMES_TEST_FILE_TIMEOUT: "3000"
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""

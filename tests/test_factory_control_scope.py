@@ -1,7 +1,7 @@
 """Offline full-module tests; no real worker/provider transport."""
 import json
 import pytest
-from test_provider_capacity_dispatch import board, policy, card, tick, completed_writer_contract
+from tests.test_provider_capacity_dispatch import board, policy, card, tick, completed_writer_contract
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as dispatch
 
@@ -254,3 +254,7 @@ def test_bom33_windows_json_preserves_admission(board, monkeypatch, target):
     path.write_bytes(b'\xef\xbb\xbf' + path.read_bytes())
     result, calls = tick(conn)
     assert calls == [task]
+
+
+# Native integration of the opted-in Windows Factory backend.
+pytestmark = pytest.mark.platforms("windows")

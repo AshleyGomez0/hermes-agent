@@ -1,8 +1,8 @@
 """Native CLI/SQLite registration and completion; no credential/model calls."""
 import json, os, sys, types
 import pytest
-from test_provider_capacity_dispatch import board
-from test_factory_control_scope import bound_review
+from tests.test_provider_capacity_dispatch import board
+from tests.test_factory_control_scope import bound_review
 from hermes_cli import kanban_db as kb, kanban_db_dispatch as dispatch
 from hermes_cli.cli_single_query import _run_single_query_mode
 from tools import kanban_tools as kt
@@ -55,8 +55,8 @@ def test_startup28_own_identity_survives_completion(board, monkeypatch, inherite
 """Registration failures follow durable admission, not an inherited policy path."""
 import json, os, sqlite3
 import pytest
-from test_provider_capacity_dispatch import board, card, policy
-from test_factory_control_scope import bound_review
+from tests.test_provider_capacity_dispatch import board, card, policy
+from tests.test_factory_control_scope import bound_review
 from hermes_cli import kanban_db as kb, kanban_db_dispatch as dispatch
 from tools import kanban_tools as kt
 
@@ -129,3 +129,49 @@ def test_admission33_dispatch_carries_factory_admission_once(board, monkeypatch)
         calls.append(factory_admitted)
     assert dispatch.dispatch_once(conn, spawn_fn=spawned).spawned
     assert calls == [True]
+
+
+@pytest.mark.parametrize('corruption', ['shape', 'readonly', 'run_type', 'writer_id', 'sha', 'workspace'])
+@pytest.mark.parametrize('copies', ['outer', 'all'])
+def test_contract36_corrupt_matching_binding_never_reaches_model(board, monkeypatch, corruption, copies):
+    conn, home, root = board
+    task, writer, repo, sha = bound_review(board, monkeypatch)
+    assert dispatch.dispatch_once(conn, spawn_fn=lambda *a: None).spawned
+    run = kb._current_run_id(conn, task)
+    dispatch._set_worker_pid(conn, task, os.getpid())
+    assert dispatch.adopt_worker_pid(conn, task, run, os.getpid())
+    saved = json.loads(conn.execute('SELECT metadata FROM task_runs WHERE id=?', (run,)).fetchone()[0])
+    bound = dict(saved['factory_review'])
+    if corruption == 'shape': bound = {'unexpected': True}
+    elif corruption == 'readonly': bound['read_only'] = False
+    elif corruption == 'run_type': bound['writer_run_id'] = True
+    elif corruption == 'writer_id': bound['writer_task_id'] = None
+    elif corruption == 'sha': bound['reviewed_sha'] = 'not-a-commit'
+    else: bound['source_workspace'] = 'relative/workspace'
+    saved['factory_review'] = bound
+    if copies == 'all':
+        saved['factory_capacity']['factory_review'] = bound
+        conn.execute("UPDATE task_events SET payload=? WHERE run_id=? AND kind='factory_capacity_permit'", (json.dumps(saved['factory_capacity']), run))
+    conn.execute('UPDATE task_runs SET metadata=? WHERE id=?', (json.dumps(saved), run))
+    conn.execute("UPDATE task_events SET payload=? WHERE run_id=? AND kind='factory_review_bound'", (json.dumps(bound), run));conn.commit()
+    monkeypatch.setenv('HERMES_KANBAN_TASK', task)
+    monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(run))
+    monkeypatch.setenv('HERMES_KANBAN_DB', str(kb.kanban_db_path()))
+    monkeypatch.setattr(kt, '_worker_run_session_ids', {})
+    facade = types.ModuleType('cli')
+    for name in ('_SeededQueryMessage', '_collect_kanban_task_images', '_collect_query_images', '_configure_quiet_agent', '_finalize_single_query', '_route_single_query_images', '_run_kanban_goal_loop_chat', '_run_quiet_single_query', '_single_query_exit_code'):
+        setattr(facade, name, lambda *a, **k: None)
+    facade._should_seed_interactive = lambda *a, **k: False
+    monkeypatch.setitem(sys.modules, 'cli', facade)
+    from hermes_cli import plugins
+    monkeypatch.setattr(plugins, 'get_plugin_manager', lambda *a, **k: types.SimpleNamespace())
+    def forbidden_boundary(*a, **k):
+        raise AssertionError('Malformed binding reached the pre-model boundary')
+    native = types.SimpleNamespace(session_id='fresh-native-origin', _claim_active_session=forbidden_boundary)
+    with pytest.raises(SystemExit):
+        _run_single_query_mode(native, 'fixture', None, True, True)
+    assert conn.execute("SELECT COUNT(*) FROM task_events WHERE run_id=? AND kind='factory_worker_started'", (run,)).fetchone()[0] == 0
+
+
+# Native integration of the opted-in Windows Factory backend.
+pytestmark = pytest.mark.platforms("windows")

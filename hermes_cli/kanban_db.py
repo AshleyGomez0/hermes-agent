@@ -2822,7 +2822,18 @@ def bind_factory_worker_identity(conn, task_id, expected_run_id, worker_session_
             if len(reviews) != 1:
                 return False
             bound = json.loads(reviews[0]['payload'])
-            if not isinstance(bound, dict) or not bound or saved.get('factory_review') != bound:
+            from hermes_cli.factory_contracts import valid_review_contract
+            if (not valid_review_contract(bound, reviewer_id=task_id)
+                    or saved.get('factory_review') != bound
+                    or not isinstance(capacity, dict)
+                    or capacity.get('role') != 'independent_reviewer'
+                    or capacity.get('factory_review') != bound):
+                return False
+            writer = get_task(conn, bound['writer_task_id'])
+            if (writer is None or writer.status != 'done'
+                    or _factory_completed_writer_identity(conn, bound['writer_task_id']) != {
+                        'writer_run_id': bound['writer_run_id'], 'writer_session_id': bound['writer_session_id']}
+                    or worker_session_id == bound['writer_session_id']):
                 return False
             pid = os.getpid()
             fingerprint = dispatch._process_fingerprint(pid)
@@ -2864,13 +2875,31 @@ def _factory_review_completion_valid(conn, task_id, expected_run_id, metadata):
             'factory_review' in saved or isinstance(saved.get('factory_capacity'), dict)
             and 'factory_review' in saved['factory_capacity'])
         incoming_has_review = isinstance(metadata, dict) and 'factory_review' in metadata
+        # Losing one copy of admission must never downgrade a Factory review
+        # to a legacy completion. Any surviving permit is checked fail-closed.
+        from hermes_cli.factory_contracts import valid_capacity_permit
+        permits = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+            "AND kind='factory_capacity_permit' ORDER BY id", (task_id, run_id)).fetchall()
+        permit = None
+        if permits:
+            if len(permits) != 1:
+                return False
+            permit = json.loads(permits[0]['payload'])
+            board_path = next((r[2] for r in conn.execute('PRAGMA database_list') if r[1] == 'main'), '')
+            if not board_path or not valid_capacity_permit(permit, board_path=Path(board_path).resolve(), reviewer_id=task_id):
+                return False
+            if bool(events) != (permit['role'] == 'independent_reviewer'):
+                return False
+        elif events or saved_has_review:
+            return False
         if not events:
             return not saved_has_review and not incoming_has_review
         if len(events) != 1 or expected_run_id is None or int(expected_run_id) != run_id:
             return False
         bound = json.loads(events[0]['payload'])
-        keys = {'writer_task_id', 'source_workspace', 'reviewed_sha', 'read_only', 'writer_run_id', 'writer_session_id'}
-        if not isinstance(bound, dict) or set(bound) != keys or bound['read_only'] is not True:
+        from hermes_cli.factory_contracts import valid_review_contract
+        if (not valid_review_contract(bound, reviewer_id=task_id)
+                or permit is None or permit.get('factory_review') != bound):
             return False
         if not isinstance(saved, dict) or saved.get('factory_review') != bound:
             return False

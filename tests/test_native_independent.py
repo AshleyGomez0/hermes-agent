@@ -2,7 +2,7 @@
 import sys, json, os, sqlite3
 from pathlib import Path
 import pytest
-from test_provider_capacity_dispatch import board, policy, card, dispatch, kb, kbc, completed_writer_contract
+from tests.test_provider_capacity_dispatch import board, policy, card, dispatch, kb, kbc, completed_writer_contract
 from hermes_cli.provider_capacity import CapacityBreaker
 
 @pytest.mark.parametrize('lane', ['ready','review'])
@@ -140,3 +140,7 @@ def test_actual_identity_logic_and_missing_bound_row(tmp_path,monkeypatch):
     assert dispatch._factory_probe_alive(str(db),'missing') is None
     assert dispatch._factory_probe_alive(str(tmp_path/'absent.sqlite'),'a') is None
     assert not (tmp_path/'absent.sqlite').exists()
+
+
+# Native integration of the opted-in Windows Factory backend.
+pytestmark = pytest.mark.platforms("windows")

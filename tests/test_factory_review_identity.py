@@ -1,7 +1,8 @@
 """Real SQLite/PID identity checks; provider transport is replaced, never called."""
 import json, os
-from test_provider_capacity_dispatch import board
-from test_factory_control_scope import bound_review
+import pytest
+from tests.test_provider_capacity_dispatch import board
+from tests.test_factory_control_scope import bound_review
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as dispatch
 from hermes_cli.provider_capacity import CapacityBreaker
@@ -51,3 +52,23 @@ def test_review22_binder_rejects_foreign_pid_and_rebind(board,monkeypatch):
     assert kb.bind_factory_worker_identity(conn,task,run_id,'replacement-session') is False
     conn.execute('UPDATE task_runs SET worker_pid=? WHERE id=?',(os.getpid()+999999,run_id));conn.commit()
     assert kb.bind_factory_worker_identity(conn,task,run_id,'actual-reviewer-session') is False
+
+
+# Native integration of the opted-in Windows Factory backend.
+pytestmark = pytest.mark.platforms("windows")
+
+
+@pytest.mark.parametrize('damage', ['lost_review_event', 'malformed_permit'])
+def test_terminal36_surviving_admission_cannot_be_downgraded(board, monkeypatch, damage):
+    conn, root, task, run, bound = started_review(board, monkeypatch)
+    if damage == 'lost_review_event':
+        conn.execute("DELETE FROM task_events WHERE run_id=? AND kind='factory_review_bound'", (run,))
+        conn.execute('UPDATE task_runs SET metadata=? WHERE id=?', ('{}', run))
+        incoming = {'worker_session_id': 'actual-reviewer-session'}
+    else:
+        conn.execute("UPDATE task_events SET payload=? WHERE run_id=? AND kind='factory_capacity_permit'", ('{"unexpected":true}', run))
+        incoming = {'worker_session_id': 'actual-reviewer-session', 'factory_review': bound}
+    conn.commit()
+    assert kb.complete_task(conn, task, result='not trusted', metadata=incoming,
+        expected_run_id=run, fire_lifecycle_hook=False) is False
+    assert kb.get_task(conn, task).status == 'running'
