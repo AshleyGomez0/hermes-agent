@@ -343,7 +343,7 @@ def test_install_scheduled_task_recreates_instead_of_change(monkeypatch, tmp_pat
     # (issue #45599 fix A: no console -> no logon CTRL_CLOSE_EVENT / 0xC000013A).
     assert "<Command>wscript.exe</Command>" in xml_seen["text"]
     assert "//B //Nologo" in xml_seen["text"]
-    assert "Hermes_Gateway_alice.vbs" in xml_seen["text"]
+    assert "Hermes_Gateway_alice.supervisor.vbs" in xml_seen["text"]
     assert "cmd.exe" not in xml_seen["text"]
 
 
@@ -370,14 +370,13 @@ def test_gateway_vbs_script_is_console_less(monkeypatch):
     for var in ("HERMES_HOME", "PYTHONIOENCODING", "HERMES_GATEWAY_DETACHED", "HERMES_GATEWAY_EXTERNAL_SUPERVISOR", "VIRTUAL_ENV", "PYTHONPATH"):
         assert var in content
     assert "--profile" in content and "work" in content
-    assert 'If rc = 0 Or rc = 78 Then WScript.Quit rc' in content
-    assert 'If rc = 75 Then' in content
-    assert 'failures = 0' in content
-    assert 'If failures >= 3 Then WScript.Quit rc' in content
-    assert 'WScript.Sleep 5000' in content
-    assert 'DateDiff("s", started_at, Now) >= 300' in content
-    assert 'fso.FileExists(stop_marker)' in content
-    assert 'fso.DeleteFile stop_marker, True' in content
+    assert "hermes_cli.gateway_windows_supervisor" in content
+    assert "--max-failures 3" in content
+    assert "--failure-window-s 300" in content
+    assert "--restart-delay-ms 5000" in content
+    assert "--home" in content
+    assert "WScript.Quit rc" in content
+    assert "CreateTextFile(owner_lock" not in content  # ownership lives in Python
     assert content.endswith("\r\n")
 
 
@@ -648,10 +647,43 @@ def test_supervisor_stop_marker_is_one_shot(monkeypatch, tmp_path):
 
     marker = gateway_windows._arm_supervisor_stop_marker()
     assert marker == home / "gateway-service" / "supervisor.stop"
-    assert marker.read_text(encoding="utf-8") == "stop\n"
+    token = marker.read_text(encoding="utf-8").strip()
+    assert len(token) == 32 and all(c in "0123456789abcdef" for c in token)
+    ack = gateway_windows._supervisor_stop_ack_path()
+    ack.write_text(token, encoding="utf-8")
+    assert gateway_windows._supervisor_stop_acknowledged(token)
 
     gateway_windows._clear_supervisor_stop_marker()
-    assert not marker.exists()
+    assert not marker.exists() and not ack.exists()
+
+
+def test_denied_task_migration_leaves_legacy_launcher_unchanged(monkeypatch, tmp_path):
+    """Access denied while replacing the task must not retrofit the new restart
+    loop into the path the still-registered legacy task already executes."""
+    script = tmp_path / "Hermes_Gateway.cmd"
+    legacy = script.with_suffix(".vbs")
+    legacy.write_text("legacy-detached", encoding="utf-8")
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(gateway_windows, "get_task_script_path", lambda: script)
+    monkeypatch.setattr(
+        gateway_windows, "_launcher_settings",
+        lambda: (r"C:\venv\Scripts\python.exe", str(tmp_path), str(tmp_path / "home"), ""),
+    )
+    monkeypatch.setattr(
+        gateway_windows, "_resolve_detached_python",
+        lambda _exe: (r"C:\venv\Scripts\python.exe", Path(r"C:\venv"), []),
+    )
+    monkeypatch.setattr(
+        gateway_windows, "_exec_schtasks",
+        lambda args: (1, "", "ERROR: Access is denied.") if args[0] == "/Delete" else (0, "", ""),
+    )
+
+    script_path = gateway_windows._write_task_script()
+    ok, detail = gateway_windows._install_scheduled_task("Hermes_Gateway", script_path)
+
+    assert not ok and "Delete failed" in detail
+    assert legacy.read_text(encoding="utf-8") == "legacy-detached"
+    assert gateway_windows._supervisor_launcher_path(script).exists()
 
 
 def test_scheduled_task_drift_retires_scheduler_restart_policy():
@@ -694,7 +726,7 @@ def test_reconcile_scheduled_task_reregisters_only_on_drift(monkeypatch, tmp_pat
     registration is deleted and re-created from the current template (so ``RestartOnFailure`` and the
     logon ``Delay`` reach existing installs), while an aligned one is left alone."""
     script_path = tmp_path / "gateway.cmd"
-    launcher = script_path.with_suffix(".vbs")
+    launcher = gateway_windows._supervisor_launcher_path(script_path)
     template = gateway_windows._build_scheduled_task_xml("Hermes_Gateway", launcher, r"PC\me")
     calls: list[list[str]] = []
     registered = {"xml": _PRE_HARDENING_TASK_XML}
@@ -721,6 +753,46 @@ def test_reconcile_scheduled_task_reregisters_only_on_drift(monkeypatch, tmp_pat
     calls.clear()
     assert gateway_windows.reconcile_scheduled_task("Hermes_Gateway") is False
     assert not any(c[0] in ("/Delete", "/Create") for c in calls)
+
+
+def test_start_refuses_failed_legacy_task_migration(monkeypatch):
+    """A failed drift repair must not activate the replacement supervisor beside
+    a legacy Scheduled Task that still owns RestartOnFailure."""
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(gateway_windows, "_print_start_attestation_warning", lambda: None)
+    monkeypatch.setattr(gateway_windows, "_gateway_pids", lambda: [])
+    monkeypatch.setattr(gateway_windows, "is_task_registered", lambda: True)
+    monkeypatch.setattr(gateway_windows, "scheduled_task_drift", lambda _name: ["obsolete: RestartOnFailure"])
+    monkeypatch.setattr(gateway_windows, "reconcile_scheduled_task", lambda _name: False)
+    monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda *a, **k: pytest.fail("must not spawn"))
+
+    with pytest.raises(RuntimeError, match="migration did not complete"):
+        gateway_windows.start()
+
+
+def test_supervisor_launcher_path_does_not_overwrite_legacy_vbs(monkeypatch, tmp_path):
+    """The new restart policy is staged at a new path so a denied task update
+    cannot change what the still-registered legacy task executes."""
+    script = tmp_path / "Hermes_Gateway.cmd"
+    legacy = script.with_suffix(".vbs")
+    legacy.write_text("legacy-detached", encoding="utf-8")
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(gateway_windows, "get_task_script_path", lambda: script)
+    monkeypatch.setattr(
+        gateway_windows, "_launcher_settings",
+        lambda: (r"C:\venv\Scripts\python.exe", str(tmp_path), str(tmp_path / "home"), ""),
+    )
+    monkeypatch.setattr(
+        gateway_windows, "_resolve_detached_python",
+        lambda _exe: (r"C:\venv\Scripts\python.exe", Path(r"C:\venv"), []),
+    )
+
+    gateway_windows._write_task_script()
+
+    supervisor = gateway_windows._supervisor_launcher_path(script)
+    assert supervisor.name == "Hermes_Gateway.supervisor.vbs"
+    assert supervisor.exists()
+    assert legacy.read_text(encoding="utf-8") == "legacy-detached"
 
 
 def _arrange_uninstalled_start(monkeypatch):
