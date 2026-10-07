@@ -641,6 +641,131 @@ def test_scheduled_task_drift_names_missing_hardening_leaves(monkeypatch):
     assert "hermes gateway install" in printed[1]
 
 
+def test_supervisor_identity_is_exact_across_profiles():
+    home = Path(r"C:\Users\review\.hermes")
+    work = home / "profiles" / "work"
+    work2 = home / "profiles" / "work2"
+    launcher = home / "gateway-service" / "Hermes_Gateway.supervisor.vbs"
+    match = gateway_windows._process_matches_gateway_supervisor
+
+    assert match(
+        "python.exe",
+        ["python.exe", "-m", "hermes_cli.gateway_windows_supervisor", "--home", str(home), "--", "gateway"],
+        home=home, launcher=launcher,
+    )
+    assert not match(
+        "python.exe",
+        ["python.exe", "-m", "hermes_cli.gateway_windows_supervisor", "--home", str(work), "--", "gateway"],
+        home=home, launcher=launcher,
+    )
+    assert not match(
+        "python.exe",
+        ["python.exe", "-m", "hermes_cli.gateway_windows_supervisor", "--home", str(work2), "--", "gateway"],
+        home=work, launcher=launcher,
+    )
+    assert not match(
+        "python.exe",
+        ["python.exe", "-m", "prefix.hermes_cli.gateway_windows_supervisor.suffix", "--home", str(home)],
+        home=home, launcher=launcher,
+    )
+
+    assert match(
+        "wscript.exe", ["wscript.exe", "//B", "//Nologo", str(launcher)],
+        home=home, launcher=launcher,
+    )
+    assert not match(
+        "wscript.exe", ["wscript.exe", "//B", str(launcher) + ".bak"],
+        home=home, launcher=launcher,
+    )
+
+
+def test_supervisor_pid_discovery_excludes_sibling_profile(monkeypatch):
+    home = Path(r"C:\Users\review\.hermes")
+    work = home / "profiles" / "work"
+    launcher = home / "gateway-service" / "Hermes_Gateway.supervisor.vbs"
+
+    class FakeError(Exception):
+        pass
+
+    class FakeProc:
+        def __init__(self, pid, name, argv):
+            self.info = {"pid": pid, "name": name, "cmdline": argv}
+
+    fake = SimpleNamespace(
+        Error=FakeError,
+        process_iter=lambda _fields: [
+            FakeProc(11, "python.exe", [
+                "python.exe", "-m", "hermes_cli.gateway_windows_supervisor",
+                "--home", str(work), "--", "gateway",
+            ]),
+            FakeProc(12, "python.exe", [
+                "python.exe", "-m", "hermes_cli.gateway_windows_supervisor",
+                "--home", str(home), "--", "gateway",
+            ]),
+            FakeProc(13, "wscript.exe", ["wscript.exe", "//B", str(launcher) + ".bak"]),
+            FakeProc(14, "wscript.exe", ["wscript.exe", "//B", "//Nologo", str(launcher)]),
+        ],
+    )
+    monkeypatch.setitem(__import__("sys").modules, "psutil", fake)
+    monkeypatch.setattr(gateway_windows, "_hermes_home", lambda: home)
+    monkeypatch.setattr(
+        gateway_windows, "get_task_script_path",
+        lambda: home / "gateway-service" / "Hermes_Gateway.cmd",
+    )
+
+    assert gateway_windows._gateway_supervisor_pids() == [12, 14]
+
+
+def test_supervisor_termination_revalidates_exact_profile(monkeypatch):
+    killed = []
+
+    class FakeError(Exception):
+        pass
+
+    class Proc:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def kill(self):
+            killed.append(self.pid)
+
+    fake = SimpleNamespace(Error=FakeError, Process=Proc)
+    monkeypatch.setitem(__import__("sys").modules, "psutil", fake)
+    monkeypatch.setattr(gateway_windows, "_gateway_supervisor_pids", lambda: [12])
+
+    assert gateway_windows._terminate_gateway_supervisors([11, 12]) == 1
+    assert killed == [12]
+
+
+def test_uninstall_removes_versioned_supervisor_launcher(monkeypatch, tmp_path):
+    script = tmp_path / "gateway-service" / "Hermes_Gateway.cmd"
+    script.parent.mkdir(parents=True)
+    supervisor = gateway_windows._supervisor_launcher_path(script)
+    legacy = script.with_suffix(".vbs")
+    for path in (script, supervisor, legacy):
+        path.write_text("x", encoding="utf-8")
+
+    startup = tmp_path / "Startup" / "Hermes_Gateway.vbs"
+    staging = tmp_path / "Startup" / "Hermes_Gateway.tmp"
+    legacy_startup = tmp_path / "Startup" / "Hermes_Gateway.cmd"
+    startup.parent.mkdir(parents=True)
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(gateway_windows, "get_task_script_path", lambda: script)
+    monkeypatch.setattr(gateway_windows, "get_startup_entry_path", lambda: startup)
+    monkeypatch.setattr(gateway_windows, "_legacy_startup_entry_path", lambda: legacy_startup)
+    monkeypatch.setattr(gateway_windows, "_startup_staging_path", lambda: staging)
+    monkeypatch.setattr(gateway_windows, "is_task_registered", lambda: False)
+    monkeypatch.setattr(
+        "hermes_cli.gateway_windows_legacy.remove_legacy_launchers", lambda: None,
+    )
+
+    gateway_windows.uninstall()
+
+    assert not script.exists()
+    assert not legacy.exists()
+    assert not supervisor.exists()
+
+
 def test_supervisor_stop_marker_is_one_shot(monkeypatch, tmp_path):
     home = tmp_path / "home"
     monkeypatch.setattr(gateway_windows, "_hermes_home", lambda: home)

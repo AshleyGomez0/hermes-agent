@@ -157,28 +157,54 @@ def _supervisor_stop_acknowledged(token: str) -> bool:
 
 
 
+def _process_matches_gateway_supervisor(
+    name: str, argv: list[str], *, home: Path, launcher: Path,
+) -> bool:
+    """Pure exact-identity predicate for one profile's Windows supervisor.
+
+    Never substring-match paths: the default home is a prefix of every named
+    profile home, and profile names may themselves be prefixes ("work" /
+    "work2"). The Python owner is recognized only by an exact "-m" module
+    pair plus an exact "--home" argument; VBS launchers match one complete
+    argv element after Windows path normalization.
+    """
+    proc_name = str(name or "").casefold()
+    normalized = [_normalize_windows_path(str(arg)) for arg in argv]
+    launcher_key = _normalize_windows_path(str(launcher))
+    if proc_name in {"wscript.exe", "cscript.exe"}:
+        return bool(launcher_key) and launcher_key in normalized[1:]
+
+    if proc_name not in {"python.exe", "pythonw.exe"}:
+        return False
+    module = "hermes_cli.gateway_windows_supervisor"
+    module_index = next(
+        (i for i in range(len(argv) - 1) if argv[i] == "-m" and argv[i + 1] == module),
+        None,
+    )
+    if module_index is None:
+        return False
+    try:
+        home_index = argv.index("--home", module_index + 2)
+        observed_home = argv[home_index + 1]
+    except (ValueError, IndexError):
+        return False
+    return _normalize_windows_path(observed_home) == _normalize_windows_path(str(home))
+
+
 def _gateway_supervisor_pids() -> list[int]:
     """Exact launcher/supervisor PIDs for this profile and no sibling profile."""
     try:
         import psutil
     except ImportError:
         return []
-    launcher = _normalize_windows_path(str(_supervisor_launcher_path(get_task_script_path())))
-    home = _normalize_windows_path(str(_hermes_home()))
+    launcher = _supervisor_launcher_path(get_task_script_path())
+    home = _hermes_home()
     pids: list[int] = []
     for proc in psutil.process_iter(["pid", "name", "cmdline"]):
         try:
-            name = str(proc.info.get("name") or "").casefold()
+            name = str(proc.info.get("name") or "")
             argv = list(map(str, proc.info.get("cmdline") or []))
-            joined = _normalize_windows_path(" ".join(argv))
-            is_vbs = name in {"wscript.exe", "cscript.exe"} and launcher and launcher in joined
-            is_owner = (
-                name in {"python.exe", "pythonw.exe"}
-                and "hermes_cli.gateway_windows_supervisor" in joined
-                and home
-                and home in joined
-            )
-            if is_vbs or is_owner:
+            if _process_matches_gateway_supervisor(name, argv, home=home, launcher=launcher):
                 pids.append(int(proc.info["pid"]))
         except (psutil.Error, OSError, ValueError, TypeError):
             continue
@@ -1444,7 +1470,9 @@ def uninstall() -> None:
     for path, label in (
         (get_startup_entry_path(), "Windows login item"), (_legacy_startup_entry_path(), "legacy Windows login item"),
         (_startup_staging_path(), "Windows login item staging file"),
-        (script_path, "Task script"), (script_path.with_suffix(".vbs"), "Task launcher"),
+        (script_path, "Task script"),
+        (script_path.with_suffix(".vbs"), "legacy Task launcher"),
+        (_supervisor_launcher_path(script_path), "Task supervisor launcher"),
     ):
         try:
             path.unlink()
