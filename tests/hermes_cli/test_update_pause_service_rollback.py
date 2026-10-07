@@ -15,7 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from hermes_cli import gateway, update_cmd, update_cmd_windows
+from hermes_cli import gateway, gateway_windows, update_cmd, update_cmd_windows
 from hermes_cli import update_pause_record as pause_record
 from hermes_cli.update_cmd_windows import ServicePauseFailed, _pause_windows_gateways_for_update
 
@@ -49,3 +49,44 @@ def test_the_pause_record_survives_exactly_when_the_service_rollback_failed(monk
     saved = pause_record.read(pause_record.record_path())
     assert (saved is not None) is restore_fails, \
         "a rolled-back pause kept its record" if saved else "the record of still-stopped gateways was deleted"
+
+
+def test_update_pause_stops_supervisor_before_force_stopping_its_child(monkeypatch):
+    """A retrying supervisor cannot replace a force-killed child during mutation."""
+    from hermes_cli import main
+
+    pid = os.getpid()
+    process = SimpleNamespace(pid=pid, profile="default", path=os.environ["HERMES_HOME"], create_time=1.0)
+    order = []
+    monkeypatch.setattr(main, "_is_windows", lambda: True)
+    monkeypatch.setattr(gateway, "find_gateway_pids", lambda all_profiles=False: [pid])
+    monkeypatch.setattr(gateway, "find_profile_gateway_processes", lambda strict=False: [process])
+    monkeypatch.setattr(gateway, "find_windows_gateway_services", lambda profile_processes=(): [])
+    monkeypatch.setattr(update_cmd_windows, "_stop_windows_gateways", lambda *a, **k: order.append("force-child") or {"default": pid})
+    monkeypatch.setattr(update_cmd_windows, "_record_attested_cold_start_profiles", lambda *a: None)
+    monkeypatch.setattr(gateway_windows, "pause_supervisor_for_update", lambda: order.append("arm-stop") or "nonce")
+    monkeypatch.setattr(gateway_windows, "wait_for_supervisor_pause", lambda token: order.append(("ack-stop", token)))
+    token = _pause_windows_gateways_for_update()
+
+    assert order == ["arm-stop", "force-child", ("ack-stop", "nonce")]
+    assert token["supervisor_paused"] is True
+
+
+def test_update_resume_restarts_a_paused_supervisor_through_its_task(monkeypatch):
+    """Update resume hands ownership back to the Scheduled Task, never a replay child."""
+    from hermes_cli import main
+
+    started = []
+    monkeypatch.setattr(main, "_refresh_windows_gateway_launchers", lambda: None)
+    monkeypatch.setattr(gateway_windows, "start", lambda: started.append("task"))
+    monkeypatch.setattr(
+        update_cmd_windows, "_relaunch_paused_gateways",
+        lambda *_a: pytest.fail("must not replay a direct child beside supervisor"),
+    )
+
+    token = {"supervisor_paused": True, "profiles": {"default": 10}, "unmapped": []}
+    update_cmd_windows._resume_paused_set(token)
+
+    assert started == ["task"]
+    assert token["supervisor_paused"] is False
+    assert token["profiles"] == {}

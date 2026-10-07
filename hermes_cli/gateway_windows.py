@@ -172,7 +172,11 @@ def _process_matches_gateway_supervisor(
     normalized = [_normalize_windows_path(str(arg)) for arg in argv]
     launcher_key = _normalize_windows_path(str(launcher))
     if proc_name in {"wscript.exe", "cscript.exe"}:
-        return bool(launcher_key) and launcher_key in normalized[1:]
+        # WScript accepts engine switches before the script. The first
+        # non-switch argument is the script position; a later occurrence is
+        # merely an argument to another script.
+        script = next((arg for arg in normalized[1:] if arg.casefold() not in {"//b", "//nologo"}), "")
+        return bool(launcher_key) and script == launcher_key
 
     if proc_name not in {"python.exe", "pythonw.exe"}:
         return False
@@ -226,6 +230,27 @@ def _terminate_gateway_supervisors(pids: list[int]) -> int:
         except (psutil.Error, OSError, ValueError):
             continue
     return killed
+
+
+
+def pause_supervisor_for_update() -> str | None:
+    """Arm the active external owner before update force-stop can kill its child."""
+    if not _gateway_supervisor_pids():
+        return None
+    marker = _arm_supervisor_stop_marker()
+    return marker.read_text(encoding="utf-8-sig").strip()
+
+
+def wait_for_supervisor_pause(token: str, *, timeout: float = 10.0) -> None:
+    """Wait for the stop owner to acknowledge and exit before mutating its code."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _supervisor_stop_acknowledged(token) and not _gateway_supervisor_pids():
+            return
+        time.sleep(0.1)
+    raise RuntimeError("Windows gateway supervisor did not stop before update; code mutation is unsafe")
+
+
 
 def hermes_service_roots() -> tuple[str, ...]:
     """Directories a Hermes-owned SCM service binary lives under: the checkout (its ``venv`` included),
@@ -1787,7 +1812,7 @@ def status(deep: bool = False) -> None:
 
 
 def start() -> None:
-    """Start the gateway using the canonical detached Windows launch path."""
+    """Start through the installed service owner, or directly for manual starts."""
     _assert_windows()
     _print_start_attestation_warning()   # once: the LAST start's ✓ turned out to be false
     running_pids = _gateway_pids()
@@ -1835,9 +1860,16 @@ def start() -> None:
     # the user wants service again, so stale marker state must not suppress it.
     _clear_supervisor_stop_marker()
 
-    # Manual starts use the same console-less direct spawn as restart() and install --start-now;
-    # Scheduled Task / Startup entries are only login persistence.
-    pid = _spawn_detached()
+    if is_task_registered():
+        code, out, err = _exec_schtasks(["/Run", "/TN", get_task_name()])
+        if code != 0:
+            raise RuntimeError(f"schtasks /Run failed (code {code}): {(err or out).strip()}")
+        _report_gateway_start("Scheduled Task supervisor")
+        return
+
+    # A Startup entry is login persistence only; without a registered task a
+    # deliberate manual start keeps its existing detached/no-service semantics.
+    _spawn_detached()
     _report_gateway_start("direct spawn")
 
 

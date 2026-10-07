@@ -994,9 +994,22 @@ def _pause_windows_gateways_for_update() -> dict | None:
         # crash before that leaves it "never asked" (still serving, dropped), after it, draining (owed).
         pause_record.mark_stop_requested(
             intended, running_pids, markers=_planned_stop_markers(running_pids, profile_processes, service_gateway_pids))
+    # The external supervisor retries a forced child exit. Arm its existing
+    # nonce/ack protocol before the child-stop ladder so it cannot relaunch old
+    # code while this update changes the checkout or dependencies.
+    from hermes_cli import gateway_windows
+    supervisor_stop_token = gateway_windows.pause_supervisor_for_update()
+    if supervisor_stop_token:
+        # If this updater dies after arming the owner, recovery must return via
+        # the Task too; never replay the child argv as an orphan.
+        intended["supervisor_paused"] = True
+        pause_record.sync(intended)
     profiles = _stop_windows_gateways(running_pids, profile_processes, service_gateway_pids, unmapped_pids, unmapped,
                                       on_request=lambda pid: pause_record.mark_stop_sent(intended, pid), born=born)
     token = {"resume_needed": True, "profiles": profiles, "unmapped_pids": unmapped_pids, "unmapped": unmapped}
+    if supervisor_stop_token:
+        gateway_windows.wait_for_supervisor_pause(supervisor_stop_token)
+        token["supervisor_paused"] = True
     # Every profile with ANY live gateway at discovery counts as running: service-supervised ones skip the
     # socket pause (absent from ``profiles``) but the SCM restart brings them back, not a cold-start.
     running_profiles = set(profiles) | {str(p.profile) for p in profile_processes.values()} | {str(s.profile) for s in service_gateways}
@@ -1599,6 +1612,19 @@ def _resume_paused_set(token: dict) -> None:
     attempt(lambda: _resume_windows_services(token))
     profiles = dict(token.get("profiles") or {})
     unmapped = list(token.get("unmapped") or [])
+    if token.get("supervisor_paused"):
+        # This token represents an installed Scheduled Task's single owner.
+        # Re-enter through start(), which invokes that task, rather than
+        # replaying a direct child beside the supervisor.
+        from hermes_cli import gateway_windows
+        attempt(gateway_windows.start)
+        if failures:
+            raise RuntimeError("; ".join(failures))
+        token["supervisor_paused"] = False
+        token["relaunched_profiles"] = sorted(profiles)
+        token["profiles"] = {}
+        token["unmapped"] = []
+        profiles, unmapped = {}, []
     if profiles or any(u.get("argv") for u in unmapped):
         launched, launched_unmapped = _relaunch_paused_gateways(profiles, unmapped)
         if launched or launched_unmapped:

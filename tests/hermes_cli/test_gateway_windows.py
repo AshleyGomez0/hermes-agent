@@ -677,6 +677,10 @@ def test_supervisor_identity_is_exact_across_profiles():
         "wscript.exe", ["wscript.exe", "//B", str(launcher) + ".bak"],
         home=home, launcher=launcher,
     )
+    assert not match(
+        "wscript.exe", ["wscript.exe", "//B", "other.vbs", str(launcher)],
+        home=home, launcher=launcher,
+    )
 
 
 def test_supervisor_pid_discovery_excludes_sibling_profile(monkeypatch):
@@ -893,6 +897,26 @@ def test_start_refuses_failed_legacy_task_migration(monkeypatch):
 
     with pytest.raises(RuntimeError, match="migration did not complete"):
         gateway_windows.start()
+
+
+def test_installed_task_start_reenters_the_external_supervisor(monkeypatch):
+    """An installed Task owns exit-75 recovery; start must not orphan a direct child."""
+    calls = []
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(gateway_windows, "_print_start_attestation_warning", lambda: None)
+    monkeypatch.setattr(gateway_windows, "_gateway_pids", lambda: [])
+    monkeypatch.setattr(gateway_windows, "is_task_registered", lambda: True)
+    monkeypatch.setattr(gateway_windows, "get_task_name", lambda: "Hermes_Gateway")
+    monkeypatch.setattr(gateway_windows, "scheduled_task_drift", lambda _name: [])
+    monkeypatch.setattr(gateway_windows, "_gateway_supervisor_pids", lambda: [])
+    monkeypatch.setattr(gateway_windows, "_clear_supervisor_stop_marker", lambda: None)
+    monkeypatch.setattr(gateway_windows, "_exec_schtasks", lambda args: calls.append(args) or (0, "", ""))
+    monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda: pytest.fail("must not direct-spawn beside Task"))
+    monkeypatch.setattr(gateway_windows, "_report_gateway_start", lambda via: calls.append(via))
+
+    gateway_windows.start()
+
+    assert calls == [["/Run", "/TN", "Hermes_Gateway"], "Scheduled Task supervisor"]
 
 
 def test_supervisor_launcher_path_does_not_overwrite_legacy_vbs(monkeypatch, tmp_path):
