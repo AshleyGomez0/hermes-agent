@@ -212,6 +212,20 @@ On legacy `cmd.exe` consoles `Ctrl+Enter` collapses to plain `Enter` — use `Es
 
 `hermes gateway install` on Windows uses **Scheduled Tasks** with a Startup-folder fallback — no admin required.
 
+When separate Windows accounts share one server, give each gateway its own task
+identity before installing or starting it. Set `gateway.windows_task_name` in that
+profile's `config.yaml` (for example, `Hermes_Gateway_Ashley`). The native install,
+start, status, stop and reconciliation paths then select that task rather than
+another account's default `Hermes_Gateway`. Use letters, digits, dots, underscores
+or hyphens; task-folder paths are not accepted. An absent value preserves the
+existing profile-derived task name. Changing it does not remove an old task:
+stop and reconcile the old owner explicitly rather than leaving two owners active.
+
+The hidden task launcher waits for the gateway process and returns its exit code.
+Task Scheduler can therefore apply `RestartOnFailure` to the actual gateway;
+closing a launcher successfully no longer conceals a failed gateway child.
+
+
 ### Install
 
 ```powershell

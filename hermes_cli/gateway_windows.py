@@ -287,6 +287,13 @@ def get_task_name() -> str:
     _assert_windows()
     from hermes_cli.gateway import _profile_suffix  # local: avoids circular init during boot
 
+    from hermes_cli.config import load_config
+
+    selected = ((load_config() or {}).get("gateway") or {}).get("windows_task_name")
+    if selected is not None:
+        if not isinstance(selected, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", selected) is None:
+            raise ValueError("gateway.windows_task_name must be a task name, not a path")
+        return selected
     suffix = _profile_suffix()
     return f"{_TASK_NAME_DEFAULT}_{suffix}" if suffix else _TASK_NAME_DEFAULT
 
@@ -392,7 +399,7 @@ def _build_gateway_cmd_script(python_path: str, working_dir: str, hermes_home: s
         f'set "VIRTUAL_ENV={_preserve_hermes_home_path(venv_dir)}"',
         f'set "PYTHONPATH={pythonpath}"',
         " ".join(_quote_cmd_script_arg(a) for a in _gateway_run_argv(python_exe_path, profile_arg)),
-        "exit /b 0",
+        "exit /b %ERRORLEVEL%",
     ]
     return "\r\n".join(lines) + "\r\n"
 
@@ -422,7 +429,7 @@ def _build_gateway_vbs_script(python_path: str, working_dir: str, hermes_home: s
     lines = [
         f"' {_TASK_DESCRIPTION}",
         "Option Explicit",
-        "Dim sh, env, existing_pp",
+        "Dim sh, env, existing_pp, rc",
         'Set sh = CreateObject("WScript.Shell")',
         'Set env = sh.Environment("PROCESS")',
         f"env.Item({q('HERMES_HOME')}) = {q(hermes_home)}",
@@ -436,8 +443,10 @@ def _build_gateway_vbs_script(python_path: str, working_dir: str, hermes_home: s
         f"  env.Item({q('PYTHONPATH')}) = {q(static_pythonpath)}",
         "End If",
         f"sh.CurrentDirectory = {q(working_dir)}",
-        # Window style 0 = hidden; bWaitOnReturn False = detached/async.
-        f"sh.Run {q(command_line)}, 0, False",
+        # Task Scheduler must observe the gateway's lifetime and exit status;
+        # detaching here made RestartOnFailure supervise an already-exited shell.
+        f"rc = sh.Run({q(command_line)}, 0, True)",
+        "WScript.Quit rc",
     ]
     return "\r\n".join(lines) + "\r\n"
 

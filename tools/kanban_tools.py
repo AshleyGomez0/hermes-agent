@@ -216,9 +216,15 @@ def _worker_run_id(task_id: str) -> Optional[int]:
         return None
 
 
+# Run-origin identity remains stable across conversation compression.
+# Including PID prevents a forked child from adopting the parent binding.
+_worker_run_session_ids: dict[tuple[int, str, int], str] = {}
+
+
 def _stamp_worker_session_metadata(task_id: str, metadata: Optional[dict]) -> Optional[dict]:
     """Add trusted worker session id metadata for this worker's own task."""
-    session_id = _own_task_env(task_id, "HERMES_SESSION_ID")
+    key = (os.getpid(), task_id, _worker_run_id(task_id))
+    session_id = _worker_run_session_ids.get(key) or _own_task_env(task_id, "HERMES_SESSION_ID")
     # Model-supplied metadata cannot impersonate an executing worker. Preserve
     # other metadata, but only the task-scoped runtime may stamp this identity.
     stamped = dict(metadata or {})
@@ -522,22 +528,123 @@ _auto_heartbeat_last_attempt: float = 0.0
 _auto_heartbeat_fence_warned = False
 
 
-def register_current_worker_from_env() -> bool:
-    """Record this worker's pid on its run when the dispatcher died before it could
-    (``adopt_worker_pid``). False only when the board says the run was already reclaimed:
-    the caller must exit. Anything unreadable (no run id, delegate child, board error)
-    lets the worker run, as before."""
+_factory_workspace_leases = {}
+
+
+def _claim_factory_workspace_lease(kb, conn, task_id, run_id):
+    """A dispatched writer holds its physical mutable workspace until process exit.
+
+    Capacity/identity records stay on the existing board. Lease files are an
+    OS-handle discovery index only. Contention is failure-neutral infrastructure
+    backpressure, not a card failure or permission to launch another writer.
+    """
+    import atexit
+    import json
+    from pathlib import Path
+    from hermes_cli.factory_workspace_lease import acquire_workspace_lease, WorkspaceLeaseUnavailable
+    from hermes_cli import kanban_db_dispatch as dispatch
+    key = (task_id, run_id)
+    if key in _factory_workspace_leases:
+        return True
+    row = conn.execute('SELECT metadata FROM task_runs WHERE id=? AND task_id=?', (run_id, task_id)).fetchone()
+    saved = json.loads(row['metadata'] or '{}') if row else {}
+    permit = saved.get('factory_capacity') if isinstance(saved, dict) else None
+    if not isinstance(permit, dict):
+        return True
+    role = permit.get('role')
+    if role in ('read_only', 'independent_reviewer'):
+        return True
+    if role not in ('writer', 'test_fix'):
+        return False
+    task = kb.get_task(conn, task_id)
+    if task is None or task.status != 'running' or task.current_run_id != run_id:
+        return False
+    try:
+        owner = Path(permit['owner'])
+        if not owner.is_absolute() or not task.workspace_path:
+            raise WorkspaceLeaseUnavailable('Missing canonical lease owner/workspace')
+        lease = acquire_workspace_lease(owner/'runtime/factory-writer-leases',Path(task.workspace_path),task_id=task_id,run_id=run_id)
+    except (WorkspaceLeaseUnavailable, OSError, ValueError, KeyError) as exc:
+        # Only this still-current worker run may release/requeue its own claim.
+        dispatch._record_task_failure(conn, task_id, str(exc), outcome='spawn_failed',
+            release_claim=True,end_run=True,infrastructure=True,expected_run_id=run_id,
+            event_payload_extra={'factory_scope_deferred':True})
+        return False
+    try:
+        with kb.write_txn(conn):
+            live = kb.get_task(conn, task_id)
+            if live is None or live.current_run_id != run_id or live.status != 'running':
+                lease.close();return False
+            kb._append_event(conn, task_id, 'factory_workspace_lease', lease.metadata, run_id=run_id)
+        _factory_workspace_leases[key]=lease
+        atexit.register(lease.close)
+        return True
+    except BaseException:
+        lease.close();raise
+
+
+def register_current_worker_from_env(*, worker_session_id: Optional[str] = None) -> bool:
+    """Register with the native CLI session before executing the worker.
+
+    Retain its run-origin identity across conversation compression. Factory
+    identity and lease failures remain fail-closed. Known legacy admission
+    preserves best-effort registration; unknown explicit Factory runs stop.
+    """
     tid = os.environ.get("HERMES_KANBAN_TASK")
     run_id = _worker_run_id(tid) if tid else None
     if run_id is None or _is_delegated_child_context():
         return True
+    session_id = (worker_session_id if worker_session_id is not None
+                  else _own_task_env(tid, "HERMES_SESSION_ID"))
+    key = (os.getpid(), tid, run_id)
+    if key in _worker_run_session_ids and _worker_run_session_ids[key] != session_id:
+        return False
+    # Only the dispatcher-owned run marker proves admission before the DB can
+    # be read. A missing/disabled inherited policy is not Factory admission.
+    spawn_admitted = os.environ.get("HERMES_KANBAN_FACTORY_RUN") == f"{tid}:{run_id}"
+    factory_required = spawn_admitted
     try:
+        import json
         from hermes_cli import kanban_db_dispatch as kbd
         with _board(None, quiet_close=True) as (_kb, conn):
-            return kbd.adopt_worker_pid(conn, tid, run_id, os.getpid())
+            row = conn.execute(
+                "SELECT r.metadata, EXISTS(SELECT 1 FROM task_events e "
+                "WHERE e.run_id=r.id AND e.task_id=r.task_id AND e.kind IN "
+                "('factory_capacity_permit','factory_review_bound')) AS factory_bound "
+                "FROM task_runs r WHERE r.id=? AND r.task_id=?", (run_id, tid)).fetchone()
+            if row is None:
+                return False
+            factory_required = True  # malformed admission is not proof of legacy
+            saved = json.loads(row['metadata'] or '{}')
+            if not isinstance(saved, dict):
+                return False
+            factory_required = bool(spawn_admitted or row['factory_bound'] or 'factory_capacity' in saved or 'factory_review' in saved)
+            if factory_required:
+                permits = conn.execute(
+                    "SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+                    "AND kind='factory_capacity_permit' ORDER BY id", (tid, run_id)).fetchall()
+                if len(permits) != 1:
+                    return False
+                permit = json.loads(permits[0]['payload'])
+                from pathlib import Path
+                from hermes_cli.factory_contracts import valid_capacity_permit
+                actual_board = next((r[2] for r in conn.execute('PRAGMA database_list') if r[1] == 'main'), '')
+                if (not actual_board or not valid_capacity_permit(permit,
+                        board_path=Path(actual_board).resolve(), reviewer_id=tid)
+                        or saved.get('factory_capacity') != permit):
+                    return False
+            if not kbd.adopt_worker_pid(conn, tid, run_id, os.getpid()):
+                return False
+            if not _kb.bind_factory_worker_identity(conn, tid, run_id, session_id):
+                return False
+            if not _claim_factory_workspace_lease(_kb, conn, tid, run_id):
+                return False
+            if session_id:
+                _worker_run_session_ids[key] = session_id
+            return True
     except Exception:
         logger.debug("kanban worker registration for %s failed", tid, exc_info=True)
-        return True
+        return not factory_required
 
 
 def heartbeat_current_worker_from_env() -> bool:

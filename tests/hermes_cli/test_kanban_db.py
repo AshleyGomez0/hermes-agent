@@ -23,6 +23,9 @@ from hermes_cli import kanban_db_workspace as kbw
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     """Isolated HERMES_HOME with an empty kanban DB."""
+    # Fake Popen instances must not enter the next test's reclaim sweep.
+    monkeypatch.setattr(kbd, "_live_worker_procs", {})
+    monkeypatch.setattr(kbd, "_recent_worker_exits", {})
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -562,6 +565,9 @@ def test_infrastructure_spawn_refusal_never_charges_the_card(
     failure on the same card still counts."""
     import tools.process_registry as process_registry
 
+    # This test simulates a systemd placement refusal, even on Windows.
+    monkeypatch.setattr(process_registry, "_IS_LINUX", True)
+    monkeypatch.setattr(process_registry.os, "getuid", lambda: 1000, raising=False)
     monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
     monkeypatch.setenv("INVOCATION_ID", "managed-gateway")
     monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: False)
@@ -801,7 +807,7 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
         capture_output=True,
         text=True,
     ).stdout
-    assert f"worktree {target}" in listed
+    assert f"worktree {target.as_posix()}" in listed.replace(chr(92), "/")
     assert f"branch refs/heads/{branch}" in listed
 
 
@@ -1575,7 +1581,7 @@ def test_connect_heals_reduced_tasks_schema_seeded_by_external_harness(kanban_ho
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
+def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch, tmp_path):
     """A `hermes` on PATH must not shadow the running install (#111569):
     the module argv wins whenever ``hermes_cli`` is importable; only an
     explicit ``$HERMES_BIN`` overrides it."""
@@ -1588,8 +1594,9 @@ def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
     monkeypatch.setattr(kbd, "_safe_which_no_cwd", lambda name: "/tmp/planted/hermes")
     assert kbd._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
 
-    monkeypatch.setenv("HERMES_BIN", "/opt/hermes/bin/hermes")
-    assert kbd._resolve_hermes_argv() == ["/opt/hermes/bin/hermes"]
+    explicit_bin = str(tmp_path / "bin" / "hermes")
+    monkeypatch.setenv("HERMES_BIN", explicit_bin)
+    assert kbd._resolve_hermes_argv() == [explicit_bin]
 
 
 
@@ -2084,3 +2091,34 @@ def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
             (t,),
         ).fetchone()
         assert row is None
+
+
+@pytest.mark.parametrize("admitted", [False, True])
+def test_factory_spawn_marker_is_owned_by_exact_dispatch_run(tmp_path, monkeypatch, admitted):
+    """Run the real child-env builder; only process creation is replaced."""
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    workspace.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_FACTORY_RUN", "inherited-parent:987")
+    monkeypatch.setattr(kbd, "_live_worker_procs", {})
+    captured = []
+    class Child:
+        pid = 4242
+        def __init__(self, command, **kwargs):
+            captured.append(kwargs["env"])
+    monkeypatch.setattr(subprocess, "Popen", Child)
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: [sys.executable, "-m", "hermes_cli.main"])
+    task = kb.Task(
+        id="t_marker", title="fixture", body=None, assignee="coder", status="running",
+        priority=0, created_by=None, created_at=0, started_at=None, completed_at=None,
+        workspace_kind="dir", workspace_path=str(workspace), claim_lock=None,
+        claim_expires=None, tenant=None, branch_name=None, current_run_id=7,
+    )
+    kbd._default_spawn(task, str(workspace), factory_admitted=admitted)
+    assert len(captured) == 1
+    assert captured[0].get("HERMES_KANBAN_FACTORY_RUN") == ("t_marker:7" if admitted else None)
+    assert captured[0]["HERMES_KANBAN_RUN_ID"] == "7"

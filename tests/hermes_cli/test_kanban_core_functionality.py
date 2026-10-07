@@ -696,6 +696,8 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
         return FakeProc()
 
     monkeypatch.setattr("subprocess.Popen", fake_popen)
+    # This argv-only stub must not enter a later test's real zombie reaper.
+    monkeypatch.setattr(kbd, "_live_worker_procs", {})
 
     conn = kbc.connect()
     try:

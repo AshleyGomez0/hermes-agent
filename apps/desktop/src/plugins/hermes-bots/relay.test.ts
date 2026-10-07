@@ -378,7 +378,11 @@ describe('relay-route socket retention (#93594)', () => {
     await vi.advanceTimersByTimeAsync(0)
     await pushAndSettle()
 
-    expect(calls).toHaveLength(0)
+    // The remaining remote forgets departed peers once. That is not a poll
+    // or a retained socket for the excluded local source.
+    expect(calls).toEqual([
+      { connectionId: 'remote-primary', method: 'bot_relay.roster.sync', params: { agents: [] } }
+    ])
     expect(pins).toHaveLength(0)
 
     stopBotRelay()

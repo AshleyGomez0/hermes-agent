@@ -1,6 +1,13 @@
 """Hermes CLI - Unified command-line interface for Hermes Agent."""
 
 import sys
+import os
+
+# A direct Factory child must bind its dispatcher-assigned process before
+# importing CLI plugins or selecting dependencies. Other entrypoints stay inert.
+if "_HERMES_FACTORY_WORKER_BOOT" in os.environ:
+    from hermes_cli.kanban_worker_process import bootstrap_direct_factory_worker
+    bootstrap_direct_factory_worker()
 
 __release_date__ = "2026.9.24"
 # Declared for type checkers and the old-updater surface audit; served lazily by __getattr__.

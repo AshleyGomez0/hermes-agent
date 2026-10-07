@@ -1402,6 +1402,7 @@ def _record_task_failure(
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
     infrastructure: bool = False,
+    expected_run_id: Optional[int] = None,
 ) -> bool:
     """Record a non-success outcome and maybe trip the circuit breaker; every
     non-success path funnels through here so ``consecutive_failures`` stays
@@ -1425,6 +1426,12 @@ def _record_task_failure(
         failure_limit = DEFAULT_FAILURE_LIMIT
     error = error[:500]
     with _kb.write_txn(conn):
+        if expected_run_id is not None:
+            own = conn.execute('SELECT current_run_id,status FROM tasks WHERE id=?',(task_id,)).fetchone()
+            if own is None or own['current_run_id'] != expected_run_id or own['status'] != 'running':
+                return False
+            if event_payload_extra and event_payload_extra.get('factory_scope_deferred'):
+                _kb._append_event(conn, task_id, 'factory_scope_deferred', {'reason':error}, run_id=expected_run_id)
         row = conn.execute(
             "SELECT consecutive_failures, status, max_retries, current_run_id "
             "FROM tasks WHERE id = ?", (task_id,),
@@ -1513,46 +1520,17 @@ def _record_task_failure(
         return True
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
-    """Record the spawned child's pid + its restart-stable fingerprint (``_process_fingerprint``), and
-    emit a ``spawned`` event carrying them. The fingerprint is what lets every later liveness/kill
-    decision tell OUR worker from a process that recycled the PID after a reboot. A failed capture is
-    persisted as ``UNVERIFIED_WORKER_FINGERPRINT``, never NULL: NULL is the legacy pre-fingerprint row
-    whose bare-PID kill authority a new spawn must not inherit."""
-    started_at = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
-    with _kb.write_txn(conn):
-        conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
-                     (int(pid), started_at, task_id))
-        run_id = _kb._current_run_id(conn, task_id)
-        if run_id is not None:
-            conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
-                         (int(pid), started_at, run_id))
-        _kb._append_event(conn, task_id, "spawned", {"pid": int(pid), "started_at": started_at}, run_id=run_id)
+
+def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int, *, expected_run_id: Optional[int] = None) -> None:
+    """Record a launcher receipt without overwriting an acknowledged worker."""
+    from hermes_cli.kanban_worker_process import record_spawn
+    record_spawn(conn, task_id, pid, expected_run_id=expected_run_id)
 
 
 def adopt_worker_pid(conn: sqlite3.Connection, task_id: str, run_id: int, pid: int) -> bool:
-    """Worker-side half of ``_set_worker_pid``, run by the worker before its first model call.
-
-    A dispatcher killed between spawning the worker and ``_set_worker_pid`` leaves the run with no
-    pid: no liveness check can see the worker, so a TTL expiry reclaims the card and spawns a second
-    worker beside it. The worker fills the missing pid itself (``worker_registered``). False when
-    ``run_id`` is no longer the card's live run: the card was reclaimed before this worker got here,
-    and it must exit without working it."""
-    started_at = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
-    with _kb.write_txn(conn):
-        row = conn.execute("SELECT status, current_run_id, worker_pid, claim_lock FROM tasks WHERE id = ?",
-                           (task_id,)).fetchone()
-        if row is None or row["status"] != "running" or row["current_run_id"] != int(run_id):
-            return False
-        # Liveness checks are host-local: a pid from another host (or pid namespace) proves nothing here.
-        if row["worker_pid"] is None and (row["claim_lock"] or "").startswith(_kb._host_prefix()):
-            conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
-                         (int(pid), started_at, task_id))
-            conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
-                         (int(pid), started_at, int(run_id)))
-            _kb._append_event(conn, task_id, "worker_registered", {"pid": int(pid), "started_at": started_at},
-                              run_id=int(run_id))
-    return True
+    """Register the real interpreter, including a verified native launcher handoff."""
+    from hermes_cli.kanban_worker_process import adopt_worker
+    return adopt_worker(conn, task_id, run_id, pid)
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -2057,17 +2035,23 @@ def dispatch_once(
     return result
 
 
-def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -> Optional[int]:
-    """Back-compat: older spawn_fn signatures (and test stubs) accept only
-    ``(task, workspace)``; pass ``board`` only when the callable supports it."""
+def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str], *, factory_admitted: bool = False) -> Optional[int]:
+    """Carry admission to supporting spawners without breaking older signatures.
+
+    Inspect before invoking: a TypeError raised by the actual spawn must never
+    be caught as a signature error and accidentally launch a second process.
+    """
     import inspect
     try:
-        sig = inspect.signature(spawn_fn)
-        if "board" in sig.parameters:
-            return spawn_fn(task, workspace, board=board)
-        return spawn_fn(task, workspace)
+        parameters = inspect.signature(spawn_fn).parameters
     except (TypeError, ValueError):
-        return spawn_fn(task, workspace)
+        parameters = {}
+    kwargs = {}
+    if 'board' in parameters:
+        kwargs['board'] = board
+    if 'factory_admitted' in parameters:
+        kwargs['factory_admitted'] = factory_admitted
+    return spawn_fn(task, workspace, **kwargs)
 
 
 def _factory_control_scope_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
@@ -2086,7 +2070,7 @@ def _factory_control_scope_guard(conn: sqlite3.Connection, task_id: str) -> Opti
     try:
         if not selector.strip():
             raise ValueError('empty control scope selector')
-        data = json.loads(Path(selector).read_text(encoding='utf-8'))
+        data = json.loads(Path(selector).read_text(encoding='utf-8-sig'))
         if not isinstance(data, dict) or type(data.get('schema_version')) is not int or data['schema_version'] != 1:
             raise ValueError('expected control schema_version=1')
         owner, board_db = data.get('owner_home'), data.get('board_db')
@@ -2117,7 +2101,7 @@ def _factory_policy_guard(conn: sqlite3.Connection, task_id: str, context=None) 
         path = Path(explicit)
         if not path.exists():
             return None  # missing policy preserves the legacy dispatch path
-        policy = json.loads(path.read_text(encoding="utf-8"))
+        policy = json.loads(path.read_text(encoding="utf-8-sig"))
         if not isinstance(policy, dict) or type(policy.get("schema_version")) is not int or policy["schema_version"] != 1:
             raise ValueError("expected schema_version=1")
         if type(policy.get("enabled")) is not bool:
@@ -2179,9 +2163,14 @@ def _factory_policy_guard(conn: sqlite3.Connection, task_id: str, context=None) 
         route = next((r for r in eligible if row is not None and tuple(row) == (r['provider'], r['model'], r['profile']) and role in r['eligible_roles']), None)
         if route is None:
             return 'factory_route_mismatch'
+        if role in ('writer', 'test_fix') and os.name != 'nt':
+            # The current physical lease backend is Windows-only. Defer before
+            # claiming or spawning; never create an infrastructure retry loop.
+            return 'factory_workspace_lease_unsupported_host'
         if context is not None:
             context.update(owner=os.path.normcase(str(Path(owner).resolve())), provider=route['provider'],
-                           ledger=str(path.resolve().parent / 'capacity.sqlite'), board=str(Path(board_db).resolve()))
+                           ledger=str(path.resolve().parent / 'capacity.sqlite'), board=str(Path(board_db).resolve()),
+                           role=role)
         return None
     except (OSError, ValueError, TypeError, AttributeError, sqlite3.Error) as exc:
         _kb._log.warning("kanban: explicit Factory routing policy invalid (%s); dispatch deferred", exc)
@@ -2337,9 +2326,9 @@ def _dispatch_lane_task(
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     try:
-        pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
+        pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board, factory_admitted=bool(factory_context))
         if pid:
-            _set_worker_pid(conn, claimed.id, int(pid))
+            _set_worker_pid(conn, claimed.id, int(pid), expected_run_id=claimed.current_run_id)
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
         _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
         # consecutive_failures is deliberately NOT reset here: resetting on
@@ -2412,24 +2401,42 @@ def _apply_default_assignee(
 
 
 def _factory_recover_successes(conn):
-    """Run-keyed durable permit survives terminal metadata replacement/restart."""
+    """Recover a completed probe from its immutable run permit, not live admission.
+
+    A finished review is no longer in the dispatchable review phase. The permit
+    that admitted that run remains authoritative for capacity accounting even
+    after routing changes; generation-token CAS prevents a late success closing
+    a newer OPEN breaker. This does not certify review or deployment health.
+    """
     import json
     from hermes_cli.provider_capacity import CapacityBreaker
-    rows = conn.execute("SELECT r.id,r.task_id,e.payload FROM task_runs r JOIN task_events e ON e.run_id=r.id AND e.kind='factory_capacity_permit' WHERE r.outcome='completed' AND r.ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM task_events x WHERE x.run_id=r.id AND x.kind='factory_capacity_observed')").fetchall()
+    actual_board = next((r[2] for r in conn.execute('PRAGMA database_list') if r[1] == 'main'), '')
+    rows = conn.execute("SELECT r.id,r.task_id,e.payload FROM task_runs r JOIN task_events e "
+        "ON e.run_id=r.id AND e.task_id=r.task_id AND e.kind='factory_capacity_permit' "
+        "WHERE r.outcome='completed' AND r.ended_at IS NOT NULL "
+        "AND (SELECT COUNT(*) FROM task_events p WHERE p.run_id=r.id AND p.task_id=r.task_id "
+        "AND p.kind='factory_capacity_permit')=1 "
+        "AND NOT EXISTS (SELECT 1 FROM task_events x WHERE x.run_id=r.id AND x.task_id=r.task_id "
+        "AND x.kind='factory_capacity_observed')").fetchall()
     for row in rows:
-        context = {}
-        if _factory_policy_guard(conn, row['task_id'], context) is not None or not context:
-            continue
         try:
             permit = json.loads(row['payload'])
-            if any(permit.get(k) != context[k] for k in ('owner', 'provider', 'ledger', 'board')):
+            if not isinstance(permit, dict) or any(not isinstance(permit.get(k), str) or not permit[k]
+                    for k in ('owner', 'provider', 'ledger', 'board')):
+                continue
+            if (not actual_board or not all(Path(permit[k]).is_absolute() for k in ('owner','ledger','board'))
+                    or Path(permit['board']).resolve() != Path(actual_board).resolve()):
                 continue
             token = permit.get('probe_token')
-            closed = CapacityBreaker(context['ledger'], enabled=True).success(context['owner'], context['provider'], token, now=time.time()) if token else False
+            if token is not None and not isinstance(token, str):
+                continue
+            closed = CapacityBreaker(permit['ledger'], enabled=True).success(
+                permit['owner'], permit['provider'], token, now=time.time()) if token else False
             with _kb.write_txn(conn):
                 _kb._append_event(conn, row['task_id'], 'factory_capacity_observed', {'closed': closed}, run_id=row['id'])
-        except (ValueError, TypeError, KeyError):
+        except (OSError, sqlite3.Error, ValueError, TypeError, KeyError):
             continue
+
 
 
 def _run_reclaim_phase(
@@ -2997,10 +3004,10 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _kb._log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
-def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
+def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str], *, launch_argv=None) -> list[str]:
     """Build the ``hermes -p <profile> --cli ... chat -q ...`` worker command."""
     cmd = [
-        *_resolve_hermes_argv(),
+        *(launch_argv if launch_argv is not None else _resolve_hermes_argv()),
         "-p", profile_arg,
         # A worker must NEVER boot the interactive TUI: its no-TTY bail-out
         # exits 0 without doing the task → "protocol violation" every attempt.
@@ -3085,7 +3092,7 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
     ).argv
 
 
-def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
+def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None, factory_admitted: bool = False) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
     Returns the child's PID so the dispatcher can detect crashes before the
@@ -3142,6 +3149,14 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         strip_launch_profile_env(env, profile_home)
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
+    # Internal per-run provenance, never inherited configuration. This lets a
+    # newly admitted Factory worker fail closed even if its board is unreadable.
+    env.pop("_HERMES_FACTORY_WORKER_BOOT", None)
+    env.pop("HERMES_KANBAN_FACTORY_RUN", None)
+    if factory_admitted:
+        if type(task.current_run_id) is not int or task.current_run_id <= 0:
+            raise ValueError("Factory spawn requires the exact claimed run")
+        env["HERMES_KANBAN_FACTORY_RUN"] = f"{task.id}:{task.current_run_id}"
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
     # Tag the session `kanban` so session-browsing surfaces filter it out by
@@ -3194,7 +3209,11 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
+    launch_argv = None
+    if factory_admitted and os.name == "nt":
+        from hermes_cli.kanban_worker_process import direct_factory_launch
+        launch_argv = direct_factory_launch(env, Path(__file__).resolve().parents[1])
+    cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"), launch_argv=launch_argv)
     # The module argv must carry the import context that made it resolvable:
     # the shim's in-process path injection is invisible to the bare child.
     _propagate_module_import_root(cmd, env)

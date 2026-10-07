@@ -426,3 +426,7 @@ def test_review_lane_cannot_dispatch_writer_contract(board, monkeypatch):
     assert calls == [], 'require_independent_reviewer accepted a writer contract for review lane'
 
 
+
+
+# Native integration of the opted-in Windows Factory backend.
+pytestmark = pytest.mark.platforms("windows")
