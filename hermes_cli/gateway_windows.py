@@ -55,8 +55,11 @@ _LAST_SPAWN_BREAKAWAY_FALLBACK: dict = {"fallback": False}
 _TASK_NAME_DEFAULT = "Hermes_Gateway"
 _TASK_DESCRIPTION = "Hermes Agent Gateway - Messaging Platform Integration"
 _TASK_LOGON_DELAY = "PT30S"
-_TASK_RESTART_INTERVAL = "PT1M"
-_TASK_RESTART_COUNT = 999
+# The Scheduled Task owns one wrapper. The wrapper, not Task Scheduler, owns
+# bounded child recovery so restart budgets cannot stack across two supervisors.
+_GATEWAY_SUPERVISOR_RESTART_DELAY_MS = 5000
+_GATEWAY_SUPERVISOR_FAILURE_WINDOW_S = 300
+_GATEWAY_SUPERVISOR_MAX_CONSECUTIVE_EXITS = 3
 
 _GATEWAY_ENV = (("PYTHONIOENCODING", "utf-8"), ("HERMES_GATEWAY_DETACHED", "1"), ("HERMES_SUPERVISED_CHILD", "1"))
 
@@ -422,11 +425,14 @@ def _build_gateway_vbs_script(python_path: str, working_dir: str, hermes_home: s
     lines = [
         f"' {_TASK_DESCRIPTION}",
         "Option Explicit",
-        "Dim sh, env, existing_pp",
+        "Dim sh, env, existing_pp, rc, failures, started_at",
         'Set sh = CreateObject("WScript.Shell")',
         'Set env = sh.Environment("PROCESS")',
         f"env.Item({q('HERMES_HOME')}) = {q(hermes_home)}",
         *[f"env.Item({q(k)}) = {q(v)}" for k, v in _GATEWAY_ENV],
+        # This wrapper is the restart-capable owner. The generic supervised
+        # marker alone intentionally does not select Hermes' exit-75 handoff.
+        f"env.Item({q('HERMES_GATEWAY_EXTERNAL_SUPERVISOR')}) = {q('1')}",
         f"env.Item({q('VIRTUAL_ENV')}) = {q(_preserve_hermes_home_path(venv_dir))}",
         # Mirror the cmd wrapper's ``PYTHONPATH=<static>;%PYTHONPATH%`` at runtime.
         f"existing_pp = env.Item({q('PYTHONPATH')})",
@@ -436,8 +442,19 @@ def _build_gateway_vbs_script(python_path: str, working_dir: str, hermes_home: s
         f"  env.Item({q('PYTHONPATH')}) = {q(static_pythonpath)}",
         "End If",
         f"sh.CurrentDirectory = {q(working_dir)}",
-        # Window style 0 = hidden; bWaitOnReturn False = detached/async.
-        f"sh.Run {q(command_line)}, 0, False",
+        "failures = 0",
+        "Do",
+        "  started_at = Now",
+        # Window style 0 = hidden; bWaitOnReturn True makes this wrapper the
+        # sole lifecycle owner of exactly one direct gateway child.
+        f"  rc = sh.Run({q(command_line)}, 0, True)",
+        # A clean/planned stop and fatal config must never be respawned.
+        "  If rc = 0 Or rc = 78 Then WScript.Quit rc",
+        f'  If DateDiff("s", started_at, Now) >= {_GATEWAY_SUPERVISOR_FAILURE_WINDOW_S} Then failures = 0',
+        "  failures = failures + 1",
+        f"  If failures >= {_GATEWAY_SUPERVISOR_MAX_CONSECUTIVE_EXITS} Then WScript.Quit rc",
+        f"  WScript.Sleep {_GATEWAY_SUPERVISOR_RESTART_DELAY_MS}",
+        "Loop",
     ]
     return "\r\n".join(lines) + "\r\n"
 
@@ -546,10 +563,6 @@ def _build_scheduled_task_xml(task_name: str, launcher_path: Path, user: str | N
     <WakeToRun>false</WakeToRun>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <Priority>7</Priority>
-    <RestartOnFailure>
-      <Interval>{_TASK_RESTART_INTERVAL}</Interval>
-      <Count>{_TASK_RESTART_COUNT}</Count>
-    </RestartOnFailure>
   </Settings>
   <Actions Context="Author">
     <Exec>
@@ -1407,9 +1420,13 @@ def _task_xml_leaf_values(xml: str) -> dict[str, str] | None:
 # template (#113670). Never a full-leaf compare: schtasks exports <UserId> as a SID while the template
 # writes DOMAIN\user, so equality would flag every healthy registration.
 _TASK_DRIFT_LEAVES = {
-    "Task/Settings/RestartOnFailure/Interval": "RestartOnFailure",
     "Task/Triggers/LogonTrigger/Delay": "LogonTrigger Delay",
     "Task/Actions/Exec/Arguments": "launcher arguments",
+}
+_TASK_DRIFT_FORBIDDEN_LIVE_LEAVES = {
+    # The VBS wrapper is now the bounded restart owner. Leaving the old
+    # Scheduler retry policy installed would reset that budget indefinitely.
+    "Task/Settings/RestartOnFailure/Interval": "RestartOnFailure",
 }
 
 
@@ -1423,10 +1440,13 @@ def compare_scheduled_task_drift(registered_xml: str, template_xml: str) -> list
         return []
     missing = [label for path, label in _TASK_DRIFT_LEAVES.items() if path in want and path not in live]
     differs = [label for path, label in _TASK_DRIFT_LEAVES.items() if path in want and path in live and live[path] != want[path]]
+    obsolete = [label for path, label in _TASK_DRIFT_FORBIDDEN_LIVE_LEAVES.items() if path in live]
     drift = []
     if missing:
         drift.append(f"missing: {', '.join(missing)}")
     drift.extend(f"{label} differs" for label in differs)
+    if obsolete:
+        drift.append(f"obsolete: {', '.join(obsolete)}")
     if live["Task@version"] != want["Task@version"]:
         drift.append(f"version {live['Task@version']} vs {want['Task@version']}")
     return drift
@@ -1453,7 +1473,7 @@ def _print_scheduled_task_drift(task_name: str) -> None:
 
 def reconcile_scheduled_task(task_name: str) -> bool:
     """Re-register the task from the current template when it drifts (#113670) — the Windows sibling
-    of ``gateway.py::refresh_systemd_unit_if_needed``. Template hardening (``RestartOnFailure``, logon
+    of ``gateway.py::refresh_systemd_unit_if_needed``. Template lifecycle hardening (bounded wrapper ownership, logon
     ``Delay``) otherwise only ever reaches fresh installs. False when aligned/unqueryable or when
     ``schtasks`` refused (typically Access Denied — the elevating ``hermes gateway install`` is the fallback)."""
     drift = scheduled_task_drift(task_name)

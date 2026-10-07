@@ -338,8 +338,7 @@ def test_install_scheduled_task_recreates_instead_of_change(monkeypatch, tmp_pat
     assert "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>" in xml_seen["text"]
     assert "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>" in xml_seen["text"]
     assert "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>" in xml_seen["text"]
-    assert "<RestartOnFailure>" in xml_seen["text"]
-    assert "<Count>999</Count>" in xml_seen["text"]
+    assert "<RestartOnFailure>" not in xml_seen["text"]
     # Scheduled Task launches the console-less .vbs via wscript.exe, never cmd.exe
     # (issue #45599 fix A: no console -> no logon CTRL_CLOSE_EVENT / 0xC000013A).
     assert "<Command>wscript.exe</Command>" in xml_seen["text"]
@@ -367,10 +366,14 @@ def test_gateway_vbs_script_is_console_less(monkeypatch):
     assert "pythonw.exe" in content
     assert "hermes_cli.main" in content
     assert "gateway run" in content
-    assert ", 0, False" in content  # hidden window, detached/async
-    for var in ("HERMES_HOME", "PYTHONIOENCODING", "HERMES_GATEWAY_DETACHED", "VIRTUAL_ENV", "PYTHONPATH"):
+    assert ", 0, True" in content  # hidden window, synchronous child ownership
+    for var in ("HERMES_HOME", "PYTHONIOENCODING", "HERMES_GATEWAY_DETACHED", "HERMES_GATEWAY_EXTERNAL_SUPERVISOR", "VIRTUAL_ENV", "PYTHONPATH"):
         assert var in content
     assert "--profile" in content and "work" in content
+    assert 'If rc = 0 Or rc = 78 Then WScript.Quit rc' in content
+    assert 'If failures >= 3 Then WScript.Quit rc' in content
+    assert 'WScript.Sleep 5000' in content
+    assert 'DateDiff("s", started_at, Now) >= 300' in content
     assert content.endswith("\r\n")
 
 
@@ -620,7 +623,7 @@ def test_scheduled_task_drift_names_missing_hardening_leaves(monkeypatch):
     template = gateway_windows._build_scheduled_task_xml("Hermes_Gateway", launcher, r"PC\me")
     drift = gateway_windows.compare_scheduled_task_drift(_PRE_HARDENING_TASK_XML, template)
     assert drift == [
-        "missing: RestartOnFailure, LogonTrigger Delay",
+        "missing: LogonTrigger Delay",
         "launcher arguments differs",
         "version 1.3 vs 1.4",
     ]
@@ -631,8 +634,26 @@ def test_scheduled_task_drift_names_missing_hardening_leaves(monkeypatch):
     monkeypatch.setattr(gateway_windows, "_resolve_task_user", lambda: r"PC\me")
     monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(map(str, a))))
     gateway_windows._print_scheduled_task_drift("Hermes_Gateway")
-    assert printed[0].startswith("⚠ Scheduled Task registration predates the current template (missing: RestartOnFailure")
+    assert printed[0].startswith("⚠ Scheduled Task registration predates the current template (missing: LogonTrigger Delay")
     assert "hermes gateway install" in printed[1]
+
+
+def test_scheduled_task_drift_retires_scheduler_restart_policy():
+    """A previous task registration must be rewritten so Scheduler retries
+    cannot reset the wrapper's bounded crash budget."""
+    launcher = Path(r"C:\Users\me\.hermes\gateway-service\Hermes_Gateway.vbs")
+    template = gateway_windows._build_scheduled_task_xml("Hermes_Gateway", launcher, r"PC\me")
+    legacy = template.replace(
+        "    <Priority>7</Priority>",
+        "    <Priority>7</Priority>\n"
+        "    <RestartOnFailure>\n"
+        "      <Interval>PT1M</Interval>\n"
+        "      <Count>999</Count>\n"
+        "    </RestartOnFailure>",
+    )
+    assert gateway_windows.compare_scheduled_task_drift(legacy, template) == [
+        "obsolete: RestartOnFailure"
+    ]
 
 
 def test_scheduled_task_drift_is_silent_when_aligned_or_unqueryable(monkeypatch):
@@ -678,7 +699,7 @@ def test_reconcile_scheduled_task_reregisters_only_on_drift(monkeypatch, tmp_pat
 
     assert gateway_windows.reconcile_scheduled_task("Hermes_Gateway") is True
     assert [c[0] for c in calls if c[0] in ("/Delete", "/Create")] == ["/Delete", "/Create"]
-    assert "<RestartOnFailure>" in registered["xml"]
+    assert "<RestartOnFailure>" not in registered["xml"]
     assert gateway_windows.compare_scheduled_task_drift(registered["xml"], template) == []
 
     calls.clear()
