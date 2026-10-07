@@ -371,9 +371,13 @@ def test_gateway_vbs_script_is_console_less(monkeypatch):
         assert var in content
     assert "--profile" in content and "work" in content
     assert 'If rc = 0 Or rc = 78 Then WScript.Quit rc' in content
+    assert 'If rc = 75 Then' in content
+    assert 'failures = 0' in content
     assert 'If failures >= 3 Then WScript.Quit rc' in content
     assert 'WScript.Sleep 5000' in content
     assert 'DateDiff("s", started_at, Now) >= 300' in content
+    assert 'fso.FileExists(stop_marker)' in content
+    assert 'fso.DeleteFile stop_marker, True' in content
     assert content.endswith("\r\n")
 
 
@@ -636,6 +640,18 @@ def test_scheduled_task_drift_names_missing_hardening_leaves(monkeypatch):
     gateway_windows._print_scheduled_task_drift("Hermes_Gateway")
     assert printed[0].startswith("⚠ Scheduled Task registration predates the current template (missing: LogonTrigger Delay")
     assert "hermes gateway install" in printed[1]
+
+
+def test_supervisor_stop_marker_is_one_shot(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    monkeypatch.setattr(gateway_windows, "_hermes_home", lambda: home)
+
+    marker = gateway_windows._arm_supervisor_stop_marker()
+    assert marker == home / "gateway-service" / "supervisor.stop"
+    assert marker.read_text(encoding="utf-8") == "stop\n"
+
+    gateway_windows._clear_supervisor_stop_marker()
+    assert not marker.exists()
 
 
 def test_scheduled_task_drift_retires_scheduler_restart_policy():

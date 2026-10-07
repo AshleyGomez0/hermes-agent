@@ -118,6 +118,25 @@ def _hermes_home() -> Path:
     return Path(get_hermes_home())
 
 
+def _supervisor_stop_marker_path() -> Path:
+    """One-shot stop request consumed by the persistent Windows VBS wrapper."""
+    return _hermes_home() / "gateway-service" / "supervisor.stop"
+
+
+def _arm_supervisor_stop_marker() -> Path:
+    marker = _supervisor_stop_marker_path()
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("stop\n", encoding="utf-8")
+    return marker
+
+
+def _clear_supervisor_stop_marker() -> None:
+    try:
+        _supervisor_stop_marker_path().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def hermes_service_roots() -> tuple[str, ...]:
     """Directories a Hermes-owned SCM service binary lives under: the checkout (its ``venv`` included),
     the running interpreter's ``Scripts`` dir (``hermes.exe`` shim) and the ``gateway-service`` launcher dir."""
@@ -422,12 +441,15 @@ def _build_gateway_vbs_script(python_path: str, working_dir: str, hermes_home: s
     command_line = subprocess.list2cmdline(_gateway_run_argv(python_exe_path, profile_arg))
     static_pythonpath = os.pathsep.join(_launcher_pythonpath_entries(extra_pythonpath))
     q = _quote_vbs_string
+    stop_marker = str(Path(hermes_home) / "gateway-service" / "supervisor.stop")
     lines = [
         f"' {_TASK_DESCRIPTION}",
         "Option Explicit",
-        "Dim sh, env, existing_pp, rc, failures, started_at",
+        "Dim sh, env, fso, existing_pp, rc, failures, started_at, stop_marker",
         'Set sh = CreateObject("WScript.Shell")',
         'Set env = sh.Environment("PROCESS")',
+        'Set fso = CreateObject("Scripting.FileSystemObject")',
+        f"stop_marker = {q(stop_marker)}",
         f"env.Item({q('HERMES_HOME')}) = {q(hermes_home)}",
         *[f"env.Item({q(k)}) = {q(v)}" for k, v in _GATEWAY_ENV],
         # This wrapper is the restart-capable owner. The generic supervised
@@ -444,16 +466,31 @@ def _build_gateway_vbs_script(python_path: str, working_dir: str, hermes_home: s
         f"sh.CurrentDirectory = {q(working_dir)}",
         "failures = 0",
         "Do",
+        "  If fso.FileExists(stop_marker) Then",
+        "    fso.DeleteFile stop_marker, True",
+        "    WScript.Quit 0",
+        "  End If",
         "  started_at = Now",
         # Window style 0 = hidden; bWaitOnReturn True makes this wrapper the
         # sole lifecycle owner of exactly one direct gateway child.
         f"  rc = sh.Run({q(command_line)}, 0, True)",
-        # A clean/planned stop and fatal config must never be respawned.
+        # A stop request wins even when the child had to be force-killed.
+        "  If fso.FileExists(stop_marker) Then",
+        "    fso.DeleteFile stop_marker, True",
+        "    WScript.Quit 0",
+        "  End If",
+        # Clean stop and fatal config are terminal. Exit 75 is an intentional
+        # external-supervisor handoff: restart it without charging crash budget.
         "  If rc = 0 Or rc = 78 Then WScript.Quit rc",
-        f'  If DateDiff("s", started_at, Now) >= {_GATEWAY_SUPERVISOR_FAILURE_WINDOW_S} Then failures = 0',
-        "  failures = failures + 1",
-        f"  If failures >= {_GATEWAY_SUPERVISOR_MAX_CONSECUTIVE_EXITS} Then WScript.Quit rc",
-        f"  WScript.Sleep {_GATEWAY_SUPERVISOR_RESTART_DELAY_MS}",
+        "  If rc = 75 Then",
+        "    failures = 0",
+        f"    WScript.Sleep {_GATEWAY_SUPERVISOR_RESTART_DELAY_MS}",
+        "  Else",
+        f'    If DateDiff("s", started_at, Now) >= {_GATEWAY_SUPERVISOR_FAILURE_WINDOW_S} Then failures = 0',
+        "    failures = failures + 1",
+        f"    If failures >= {_GATEWAY_SUPERVISOR_MAX_CONSECUTIVE_EXITS} Then WScript.Quit rc",
+        f"    WScript.Sleep {_GATEWAY_SUPERVISOR_RESTART_DELAY_MS}",
+        "  End If",
         "Loop",
     ]
     return "\r\n".join(lines) + "\r\n"
@@ -1706,6 +1743,10 @@ def start() -> None:
     elif is_task_registered():
         reconcile_scheduled_task(get_task_name())   # like systemd's regenerate-on-stale before a start
 
+    # A previous stop arms a one-shot wrapper marker. Any explicit start means
+    # the user wants service again, so stale marker state must not suppress it.
+    _clear_supervisor_stop_marker()
+
     # Manual starts use the same console-less direct spawn as restart() and install --start-now;
     # Scheduled Task / Startup entries are only login persistence.
     pid = _spawn_detached()
@@ -1809,6 +1850,11 @@ def stop() -> None:
     # A user-initiated stop is a planned death: don't later report it as a silent crash.
     _clear_start_attestation()
 
+    # Arm the persistent wrapper before asking the child to drain. This closes
+    # the Startup-folder gap: if graceful drain fails and we force-kill the
+    # child, the wrapper consumes this marker instead of respawning it.
+    _arm_supervisor_stop_marker()
+
     pid = get_running_pid()
     stop_pids = _collect_gateway_stop_pids(pid)
     # Fingerprint before the drain: the kill below must refuse a PID recycled during the wait.
@@ -1831,6 +1877,15 @@ def stop() -> None:
     if killed:
         stopped_any = True
         print(f"✓ Killed {killed} gateway process(es)")
+    # A live persistent wrapper consumes the one-shot marker immediately after
+    # its child returns (or within the bounded retry sleep). Do not leave the
+    # marker behind to suppress a future login launch if no wrapper was alive.
+    deadline = time.monotonic() + 6.0
+    marker = _supervisor_stop_marker_path()
+    while marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    _clear_supervisor_stop_marker()
+
     if stopped_any:
         print("✓ Gateway stopped (drained cleanly)" if drained else "✓ Gateway stopped")
     else:
