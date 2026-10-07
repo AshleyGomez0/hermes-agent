@@ -887,6 +887,46 @@ def _discover_windows_gateways():
     return profile_processes, service_gateways, service_gateway_pids, running_pids
 
 
+@contextmanager
+def _windows_profile_scope(home: Path):
+    """Bind one fleet member while talking to its per-home Task supervisor."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    scope = set_hermes_home_override(str(home))
+    try:
+        yield
+    finally:
+        reset_hermes_home_override(scope)
+
+
+def _windows_supervisor_profile_homes(profile_processes: dict) -> dict[str, str]:
+    """Every live profile home whose Scheduled-Task owner can outlive its child."""
+    from hermes_cli.profiles import profiles_to_serve
+    homes = {str(name): str(home) for name, home in profiles_to_serve(
+        True, include_standalone=True, include_parked=True
+    )}
+    homes.update({str(proc.profile): str(proc.path) for proc in profile_processes.values()})
+    return homes
+
+
+def _pause_windows_supervisors(profile_homes: dict[str, str]) -> tuple[dict[str, str], dict[str, str]]:
+    """Arm each live profile's existing supervisor before any fleet child is stopped."""
+    from hermes_cli import gateway_windows
+    paused, nonces = {}, {}
+    for profile, home in profile_homes.items():
+        with _windows_profile_scope(Path(home)):
+            if nonce := gateway_windows.pause_supervisor_for_update():
+                paused[profile], nonces[profile] = home, nonce
+    return paused, nonces
+
+
+def _wait_for_windows_supervisor_pauses(nonces: dict[str, str], homes: dict[str, str]) -> None:
+    """Require every owner that was armed to ACK and exit before tree mutation."""
+    from hermes_cli import gateway_windows
+    for profile, nonce in nonces.items():
+        with _windows_profile_scope(Path(homes[profile])):
+            gateway_windows.wait_for_supervisor_pause(nonce)
+
+
 def _request_socket_pauses(running_pids, profile_processes, service_gateway_pids, on_request=None):
     """Marker + socket-first pause for every profile-mapped gateway; ``(profiles, mapped_pids, socket_acks)``.
 
@@ -955,8 +995,21 @@ def _pause_windows_gateways_for_update() -> dict | None:
     with _abort_on_error("Could not read the gateways an earlier update paused"):
         adopted, claims = pause_record.adopt_orphans()
     profile_processes, service_gateways, service_gateway_pids, running_pids = _discover_windows_gateways()
+    supervisor_homes, supervisor_nonces = _pause_windows_supervisors(
+        _windows_supervisor_profile_homes(profile_processes)
+    )
     if not running_pids:
-        return _cold_start_pause_token(adopted, claims)
+        token = _cold_start_pause_token(adopted, claims)
+        if not supervisor_homes:
+            return token
+        token = token or {"resume_needed": True, "profiles": {}, "unmapped_pids": [], "unmapped": []}
+        token["supervisor_paused_profiles"] = supervisor_homes
+        # A retrying owner can be between children: it still must be durably owed and ACKed before
+        # the checkout changes, rather than treating its absent child as a cold update.
+        pause_record.record_pause(token, adopted, claims)
+        _wait_for_windows_supervisor_pauses(supervisor_nonces, supervisor_homes)
+        pause_record.sync(token)
+        return token
     unmapped_pids = [pid for pid in running_pids if pid not in profile_processes and pid not in service_gateway_pids]
     from gateway.status import get_process_start_time
     from hermes_cli.update_fleet_scope import gateway_pid_home
@@ -994,22 +1047,20 @@ def _pause_windows_gateways_for_update() -> dict | None:
         # crash before that leaves it "never asked" (still serving, dropped), after it, draining (owed).
         pause_record.mark_stop_requested(
             intended, running_pids, markers=_planned_stop_markers(running_pids, profile_processes, service_gateway_pids))
-    # The external supervisor retries a forced child exit. Arm its existing
-    # nonce/ack protocol before the child-stop ladder so it cannot relaunch old
-    # code while this update changes the checkout or dependencies.
-    from hermes_cli import gateway_windows
-    supervisor_stop_token = gateway_windows.pause_supervisor_for_update()
-    if supervisor_stop_token:
+    # The external supervisors retry a forced child exit. Arm every profile's
+    # existing nonce/ack protocol before the child-stop ladder so none can
+    # relaunch old code while this update changes the checkout or dependencies.
+    if supervisor_homes:
         # If this updater dies after arming the owner, recovery must return via
         # the Task too; never replay the child argv as an orphan.
-        intended["supervisor_paused"] = True
+        intended["supervisor_paused_profiles"] = supervisor_homes
         pause_record.sync(intended)
     profiles = _stop_windows_gateways(running_pids, profile_processes, service_gateway_pids, unmapped_pids, unmapped,
                                       on_request=lambda pid: pause_record.mark_stop_sent(intended, pid), born=born)
     token = {"resume_needed": True, "profiles": profiles, "unmapped_pids": unmapped_pids, "unmapped": unmapped}
-    if supervisor_stop_token:
-        gateway_windows.wait_for_supervisor_pause(supervisor_stop_token)
-        token["supervisor_paused"] = True
+    if supervisor_homes:
+        _wait_for_windows_supervisor_pauses(supervisor_nonces, supervisor_homes)
+        token["supervisor_paused_profiles"] = supervisor_homes
     # Every profile with ANY live gateway at discovery counts as running: service-supervised ones skip the
     # socket pause (absent from ``profiles``) but the SCM restart brings them back, not a cold-start.
     running_profiles = set(profiles) | {str(p.profile) for p in profile_processes.values()} | {str(s.profile) for s in service_gateways}
@@ -1612,19 +1663,25 @@ def _resume_paused_set(token: dict) -> None:
     attempt(lambda: _resume_windows_services(token))
     profiles = dict(token.get("profiles") or {})
     unmapped = list(token.get("unmapped") or [])
-    if token.get("supervisor_paused"):
-        # This token represents an installed Scheduled Task's single owner.
-        # Re-enter through start(), which invokes that task, rather than
-        # replaying a direct child beside the supervisor.
-        from hermes_cli import gateway_windows
-        attempt(gateway_windows.start)
+    supervisor_profiles = dict(token.get("supervisor_paused_profiles") or {})
+    if token.get("supervisor_paused") and not supervisor_profiles:
+        # Compatibility with records written before supervisors were tracked per profile.
+        from hermes_constants import get_hermes_home
+        supervisor_profiles = {"default": str(get_hermes_home())}
+    if supervisor_profiles:
+        # Re-enter every installed Scheduled Task through its own owner, never
+        # replaying a child beside that profile's supervisor.
+        for profile, home in supervisor_profiles.items():
+            attempt(lambda home=home: _start_windows_supervisor_for_update(home))
         if failures:
             raise RuntimeError("; ".join(failures))
         token["supervisor_paused"] = False
-        token["relaunched_profiles"] = sorted(profiles)
-        token["profiles"] = {}
-        token["unmapped"] = []
-        profiles, unmapped = {}, []
+        token["supervisor_paused_profiles"] = {}
+        resumed = sorted(set(supervisor_profiles) & set(profiles))
+        token["relaunched_profiles"] = sorted({*(token.get("relaunched_profiles") or []), *resumed})
+        for profile in supervisor_profiles:
+            profiles.pop(profile, None)
+        token["profiles"] = profiles
     if profiles or any(u.get("argv") for u in unmapped):
         launched, launched_unmapped = _relaunch_paused_gateways(profiles, unmapped)
         if launched or launched_unmapped:
@@ -1648,6 +1705,13 @@ def _resume_paused_set(token: dict) -> None:
     if failures:
         raise RuntimeError("; ".join(failures))
     token["resume_needed"] = False
+
+
+def _start_windows_supervisor_for_update(home: str) -> None:
+    """Start one recorded Task while its profile-scoped launcher resolves its own home."""
+    from hermes_cli import gateway_windows
+    with _windows_profile_scope(Path(home)):
+        gateway_windows.start()
 
 
 def _resume_windows_gateways_and_merge_outcome(outcome, _windows_gateway_resume, gateway_mode: bool):
