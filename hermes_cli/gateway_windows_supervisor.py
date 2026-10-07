@@ -7,6 +7,8 @@ spawned. Stop requests carry a nonce and are acknowledged by the lock owner.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import os
 import subprocess
 import sys
@@ -136,9 +138,41 @@ def supervise(
         owner.release()
 
 
-def _parser() -> argparse.ArgumentParser:
+def python_supervisor_home(argv: list[str]) -> str | None:
+    """Read the owner's home only when Python actually enters this supervisor module."""
+    index = 1
+    while index < len(argv):
+        arg = argv[index]
+        if not arg.startswith("-") or arg in {"-", "--", "-m"}:
+            break
+        # CPython consumes short flags in clusters; W/X consume the rest of
+        # their cluster as a value, or the next argv element when empty.
+        flags = arg[1:]
+        for offset, flag in enumerate(flags):
+            if flag in "WX":
+                if offset == len(flags) - 1:
+                    index += 1
+                break
+            if flag not in "bBdEiIOPqsSuv":
+                return None
+        index += 1
+    if argv[index:index + 2] != ["-m", "hermes_cli.gateway_windows_supervisor"]:
+        return None
+    options = argv[index + 2:]
+    options = options[:options.index("--")] if "--" in options else options
+    # Reuse argparse's option/value grammar, retaining every home occurrence
+    # so duplicate ownership claims cannot be hidden by last-value-wins.
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            ns = _parser(home_action="append").parse_args(options)
+    except SystemExit:
+        return None
+    return ns.home[0] if len(ns.home) == 1 and not ns.child else None
+
+
+def _parser(*, home_action: str = "store") -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--home", required=True)
+    parser.add_argument("--home", required=True, action=home_action)
     parser.add_argument("--restart-delay-ms", type=int, default=DEFAULT_RESTART_DELAY_MS)
     parser.add_argument("--failure-window-s", type=int, default=DEFAULT_FAILURE_WINDOW_S)
     parser.add_argument("--max-failures", type=int, default=DEFAULT_MAX_CONSECUTIVE_EXITS)

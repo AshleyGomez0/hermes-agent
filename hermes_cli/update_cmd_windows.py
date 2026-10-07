@@ -908,13 +908,20 @@ def _windows_supervisor_profile_homes(profile_processes: dict) -> dict[str, str]
     return homes
 
 
-def _pause_windows_supervisors(profile_homes: dict[str, str]) -> tuple[dict[str, str], dict[str, str]]:
+def _pause_windows_supervisors(profile_homes: dict[str, str], token: dict) -> tuple[dict[str, str], dict[str, str]]:
     """Arm each live profile's existing supervisor before any fleet child is stopped."""
     from hermes_cli import gateway_windows
+    from hermes_cli import update_pause_record
     paused, nonces = {}, {}
     for profile, home in profile_homes.items():
+        def record_owner():
+            # A failed strict write must prevent the marker; already recorded
+            # owners (including adopted debt) remain recoverable on any abort.
+            token.setdefault("supervisor_paused_profiles", {})[profile] = home
+            update_pause_record.write(token)
+
         with _windows_profile_scope(Path(home)):
-            if nonce := gateway_windows.pause_supervisor_for_update():
+            if nonce := gateway_windows.pause_supervisor_for_update(before_stop=record_owner):
                 paused[profile], nonces[profile] = home, nonce
     return paused, nonces
 
@@ -1004,11 +1011,9 @@ def _pause_windows_gateways_for_update() -> dict | None:
         # A retrying owner can be between children: it still must be durably owed and ACKed before
         # the checkout changes, rather than treating its absent child as a cold update.
         pause_record.record_pause(token, adopted, claims)
-        supervisor_homes, supervisor_nonces = _pause_windows_supervisors(supervisor_candidates)
+        supervisor_homes, supervisor_nonces = _pause_windows_supervisors(supervisor_candidates, token)
         if not supervisor_homes:
             return token
-        token["supervisor_paused_profiles"] = supervisor_homes
-        pause_record.sync(token)
         _wait_for_windows_supervisor_pauses(supervisor_nonces, supervisor_homes)
         pause_record.sync(token)
         return token
@@ -1051,21 +1056,16 @@ def _pause_windows_gateways_for_update() -> dict | None:
             intended, running_pids, markers=_planned_stop_markers(running_pids, profile_processes, service_gateway_pids))
     # The pause record now carries a recovery obligation.  Only after that
     # durable commit may a supervisor marker make an external owner exit.
-    supervisor_homes, supervisor_nonces = _pause_windows_supervisors(supervisor_candidates)
+    supervisor_homes, supervisor_nonces = _pause_windows_supervisors(supervisor_candidates, intended)
     # The external supervisors retry a forced child exit. Arm every profile's
     # existing nonce/ack protocol before the child-stop ladder so none can
     # relaunch old code while this update changes the checkout or dependencies.
-    if supervisor_homes:
-        # If this updater dies after arming the owner, recovery must return via
-        # the Task too; never replay the child argv as an orphan.
-        intended["supervisor_paused_profiles"] = supervisor_homes
-        pause_record.sync(intended)
     profiles = _stop_windows_gateways(running_pids, profile_processes, service_gateway_pids, unmapped_pids, unmapped,
                                       on_request=lambda pid: pause_record.mark_stop_sent(intended, pid), born=born)
     token = {"resume_needed": True, "profiles": profiles, "unmapped_pids": unmapped_pids, "unmapped": unmapped}
     if supervisor_homes:
         _wait_for_windows_supervisor_pauses(supervisor_nonces, supervisor_homes)
-        token["supervisor_paused_profiles"] = supervisor_homes
+        token["supervisor_paused_profiles"] = dict(intended["supervisor_paused_profiles"])
     # Every profile with ANY live gateway at discovery counts as running: service-supervised ones skip the
     # socket pause (absent from ``profiles``) but the SCM restart brings them back, not a cold-start.
     running_profiles = set(profiles) | {str(p.profile) for p in profile_processes.values()} | {str(s.profile) for s in service_gateways}
@@ -1726,8 +1726,25 @@ def _start_windows_supervisor_for_update(home: str) -> None:
     from hermes_cli import gateway_windows
     with _windows_profile_scope(Path(home)):
         gateway_windows.start()
-        if not gateway_windows._wait_for_gateway_ready(home=Path(home)):
+        if not gateway_windows._wait_for_gateway_ready(
+            home=Path(home), timeout_s=60.0,
+            pid_filter=lambda pids: _startup_ready_gateway_pids(Path(home), pids),
+        ):
             raise RuntimeError(f"Windows gateway supervisor for {home} did not become ready")
+
+
+def _startup_ready_gateway_pids(home: Path, pids: list[int]) -> list[int]:
+    """Only completed startup from this home's live incarnation can retire Task debt."""
+    from gateway.status import get_process_start_time, get_runtime_status_running_pid, read_runtime_status
+    runtime = read_runtime_status(home / "gateway_state.json") or {}
+    if runtime.get("gateway_state") not in {"running", "degraded"}:
+        return []
+    pid = runtime.get("pid")
+    if pid not in pids or runtime.get("start_time") is None:
+        return []
+    if runtime["start_time"] != get_process_start_time(pid):
+        return []
+    return [pid] if get_runtime_status_running_pid(runtime, expected_home=home) == pid else []
 
 
 def _resume_windows_gateways_and_merge_outcome(outcome, _windows_gateway_resume, gateway_mode: bool):

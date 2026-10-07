@@ -64,7 +64,7 @@ def test_update_pause_stops_supervisor_before_force_stopping_its_child(monkeypat
     monkeypatch.setattr(gateway, "find_windows_gateway_services", lambda profile_processes=(): [])
     monkeypatch.setattr(update_cmd_windows, "_stop_windows_gateways", lambda *a, **k: order.append("force-child") or {"default": pid})
     monkeypatch.setattr(update_cmd_windows, "_record_attested_cold_start_profiles", lambda *a: None)
-    monkeypatch.setattr(gateway_windows, "pause_supervisor_for_update", lambda: order.append("arm-stop") or "nonce")
+    monkeypatch.setattr(gateway_windows, "pause_supervisor_for_update", lambda *, before_stop: before_stop() or order.append("arm-stop") or "nonce")
     monkeypatch.setattr(gateway_windows, "wait_for_supervisor_pause", lambda token: order.append(("ack-stop", token)))
     token = _pause_windows_gateways_for_update()
 
@@ -90,7 +90,7 @@ def test_update_pauses_every_profile_supervisor_before_stopping_the_host_fleet(m
     monkeypatch.setattr(update_cmd_windows, "_discover_windows_gateways", lambda: (processes, [], set(), [101, 202]))
     monkeypatch.setattr(update_cmd_windows, "_stop_windows_gateways", lambda *_a, **_k: calls.append("stop") or {"default": 101, "sibling": 202})
     monkeypatch.setattr(update_cmd_windows, "_record_attested_cold_start_profiles", lambda *_a: None)
-    monkeypatch.setattr(gateway_windows, "pause_supervisor_for_update", lambda: calls.append(("arm", get_hermes_home_override())) or "nonce")
+    monkeypatch.setattr(gateway_windows, "pause_supervisor_for_update", lambda *, before_stop: before_stop() or calls.append(("arm", get_hermes_home_override())) or "nonce")
     monkeypatch.setattr(gateway_windows, "wait_for_supervisor_pause", lambda nonce: calls.append(("ack", get_hermes_home_override(), nonce)))
 
     token = _pause_windows_gateways_for_update()
@@ -113,7 +113,7 @@ def test_update_does_not_arm_a_supervisor_before_its_pause_is_durable(monkeypatc
     monkeypatch.setattr(update_cmd_windows, "_discover_windows_gateways", lambda: ({101: process}, [], set(), [101]))
     monkeypatch.setattr(update_cmd_windows, "_windows_supervisor_profile_homes", lambda *_a: {"default": str(home)})
     monkeypatch.setattr(pause_record, "record_pause", lambda *_a: (_ for _ in ()).throw(OSError("disk full")))
-    monkeypatch.setattr(gateway_windows, "pause_supervisor_for_update", lambda: pytest.fail("marker armed before record"))
+    monkeypatch.setattr(gateway_windows, "pause_supervisor_for_update", lambda **_kw: pytest.fail("marker armed before record"))
 
     with pytest.raises(RuntimeError, match="Could not record"):
         _pause_windows_gateways_for_update()
@@ -131,7 +131,7 @@ def test_update_pauses_a_retrying_supervisor_even_when_its_child_is_absent(monke
     monkeypatch.setattr(profiles, "profiles_to_serve", lambda *_a, **_k: [("default", home)])
     monkeypatch.setattr(update_cmd_windows, "_discover_windows_gateways", lambda: ({}, [], set(), []))
     monkeypatch.setattr(update_cmd_windows, "_cold_start_pause_token", lambda *_a: None)
-    monkeypatch.setattr(gateway_windows, "pause_supervisor_for_update", lambda: calls.append(("arm", get_hermes_home_override())) or "nonce")
+    monkeypatch.setattr(gateway_windows, "pause_supervisor_for_update", lambda *, before_stop: before_stop() or calls.append(("arm", get_hermes_home_override())) or "nonce")
     monkeypatch.setattr(gateway_windows, "wait_for_supervisor_pause", lambda nonce: calls.append(("ack", get_hermes_home_override(), nonce)))
 
     token = _pause_windows_gateways_for_update()

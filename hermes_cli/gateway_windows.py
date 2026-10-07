@@ -180,19 +180,9 @@ def _process_matches_gateway_supervisor(
 
     if proc_name not in {"python.exe", "pythonw.exe"}:
         return False
-    module = "hermes_cli.gateway_windows_supervisor"
-    module_index = next(
-        (i for i in range(len(argv) - 1) if argv[i] == "-m" and argv[i + 1] == module),
-        None,
-    )
-    if module_index is None:
-        return False
-    try:
-        home_index = argv.index("--home", module_index + 2)
-        observed_home = argv[home_index + 1]
-    except (ValueError, IndexError):
-        return False
-    return _normalize_windows_path(observed_home) == _normalize_windows_path(str(home))
+    from hermes_cli.gateway_windows_supervisor import python_supervisor_home
+    observed_home = python_supervisor_home(argv)
+    return observed_home is not None and _normalize_windows_path(observed_home) == _normalize_windows_path(str(home))
 
 
 def _gateway_supervisor_pids() -> list[int]:
@@ -233,10 +223,12 @@ def _terminate_gateway_supervisors(pids: list[int]) -> int:
 
 
 
-def pause_supervisor_for_update() -> str | None:
+def pause_supervisor_for_update(*, before_stop=None) -> str | None:
     """Arm the active external owner before update force-stop can kill its child."""
     if not _gateway_supervisor_pids():
         return None
+    if before_stop is not None:
+        before_stop()
     marker = _arm_supervisor_stop_marker()
     return marker.read_text(encoding="utf-8-sig").strip()
 
