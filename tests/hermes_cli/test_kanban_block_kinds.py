@@ -249,3 +249,35 @@ def test_explicit_unblock_allows_recovery_from_legacy_todo(kanban_home: Path) ->
             conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (tid,))
         assert kb.recompute_ready(conn) == 1
         assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_blocked_needs_input_survives_missing_newer_block_event(kanban_home: Path) -> None:
+    """An old unblock event cannot override the persisted new blocked state."""
+    with kbc.connect_closing() as conn:
+        tid = _running_task(conn, title="repeat-needs-input")
+        kb.block_task(conn, tid, reason="first", kind="needs_input")
+        assert kb.unblock_task(conn, tid)
+        # Recovered row records a newer needs_input hold but its blocked
+        # event was lost. The older unblocked event must not release it.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='blocked', block_kind='needs_input' WHERE id=?",
+                (tid,),
+            )
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_todo_needs_input_supports_explicit_unblock(kanban_home: Path) -> None:
+    """Recovery parks a card in todo; the supported API must still release it."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="legacy-todo", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='todo', block_kind='needs_input' WHERE id=?",
+                (tid,),
+            )
+        assert kb.recompute_ready(conn) == 0
+        assert kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "ready"
+        assert [e for e in kb.list_events(conn, tid) if e.kind == "unblocked"]

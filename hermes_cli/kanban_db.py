@@ -2082,8 +2082,10 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
             task_id = row["id"]
             cur_status = row["status"]
             if row["block_kind"] == "needs_input":
-                # Legacy/recovery paths can leave an operator-blocked card in
-                # todo. Only an explicit subsequent unblock may release it.
+                # A blocked row is authoritative even if its latest block event
+                # was pruned. A legacy todo row requires explicit release.
+                if cur_status == "blocked":
+                    continue
                 last = conn.execute(
                     "SELECT kind FROM task_events WHERE task_id = ? "
                     "AND kind IN ('blocked', 'unblocked') "
@@ -3615,7 +3617,9 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
+            "WHERE id = ? AND (status IN ('blocked', 'scheduled') "
+              "OR (status = 'todo' AND block_kind = 'needs_input'))",
+              (new_status, task_id),
         )
         if cur.rowcount != 1:
             return False
