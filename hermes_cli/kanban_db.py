@@ -2081,9 +2081,17 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
-            if cur_status == "blocked" and (
-                row["block_kind"] == "needs_input" or _has_sticky_block(conn, task_id)
-            ):
+            if row["block_kind"] == "needs_input":
+                # Legacy/recovery paths can leave an operator-blocked card in
+                # todo. Only an explicit subsequent unblock may release it.
+                last = conn.execute(
+                    "SELECT kind FROM task_events WHERE task_id = ? "
+                    "AND kind IN ('blocked', 'unblocked') "
+                    "ORDER BY id DESC LIMIT 1", (task_id,),
+                ).fetchone()
+                if last is None or last["kind"] != "unblocked":
+                    continue
+            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Explicit human-intervention block; only ``unblock_task`` may exit it.
                 continue
             parents = conn.execute(

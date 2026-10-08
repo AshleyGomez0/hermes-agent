@@ -224,3 +224,28 @@ def test_transient_block_without_event_can_resume(kanban_home: Path) -> None:
             )
         assert kb.recompute_ready(conn) == 1
         assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_todo_needs_input_cannot_auto_resurrect(kanban_home: Path) -> None:
+    """Legacy recovery can leave needs_input on todo; it must not dispatch."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="needs-owner-decision", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='todo', block_kind='needs_input' WHERE id=?",
+                (tid,),
+            )
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, tid).status == "todo"
+
+
+def test_explicit_unblock_allows_recovery_from_legacy_todo(kanban_home: Path) -> None:
+    """Human unblock supersedes a retained needs_input classification."""
+    with kbc.connect_closing() as conn:
+        tid = _running_task(conn, title="manual-release")
+        kb.block_task(conn, tid, reason="needs approval", kind="needs_input")
+        assert kb.unblock_task(conn, tid)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (tid,))
+        assert kb.recompute_ready(conn) == 1
+        assert kb.get_task(conn, tid).status == "ready"
