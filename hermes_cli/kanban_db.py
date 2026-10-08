@@ -3598,9 +3598,16 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             if _task_status(conn, task_id) == "blocked"
             else "ready"
         )
+        row = conn.execute(
+            "SELECT status, block_kind FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        recover_todo = bool(
+            row and row["status"] == "todo" and row["block_kind"] == "needs_input"
+        )
         _reclaim_dangling_run(
-            conn, task_id, statuses=("blocked", "scheduled"), now=now,
-            note="invariant recovery on unblock",
+            conn, task_id,
+            statuses=("blocked", "scheduled", "todo") if recover_todo else ("blocked", "scheduled"),
+            now=now, note="invariant recovery on unblock",
         )
         # Re-gate on parent completion before restoring the source phase.
         landing_status = _landing_status_after_parents(conn, task_id)

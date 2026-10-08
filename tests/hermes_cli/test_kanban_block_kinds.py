@@ -28,6 +28,7 @@ from hermes_cli import kanban as kanban_cli
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from plugins.kanban.dashboard import plugin_api
 
 
 @pytest.fixture
@@ -280,4 +281,36 @@ def test_todo_needs_input_supports_explicit_unblock(kanban_home: Path) -> None:
         assert kb.recompute_ready(conn) == 0
         assert kb.unblock_task(conn, tid)
         assert kb.get_task(conn, tid).status == "ready"
+        assert [e for e in kb.list_events(conn, tid) if e.kind == "unblocked"]
+
+
+def test_recovered_todo_unblock_closes_dangling_run(kanban_home: Path) -> None:
+    """Clearing current_run_id must not orphan a live task_runs row."""
+    with kbc.connect_closing() as conn:
+        tid = _running_task(conn, title="orphaned-run")
+        run_id = kb.get_task(conn, tid).current_run_id
+        assert run_id is not None
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='todo', block_kind='needs_input' WHERE id=?",
+                (tid,),
+            )
+        assert kb.unblock_task(conn, tid)
+        row = conn.execute("SELECT ended_at FROM task_runs WHERE id=?", (run_id,)).fetchone()
+        assert row is not None and row["ended_at"] is not None
+
+
+def test_dashboard_releases_recovered_todo_needs_input(kanban_home: Path) -> None:
+    """Dashboard Ready action must use the eventful unblock path."""
+    with kbc.connect_closing() as conn:
+        parent = kb.create_task(conn, title="unfinished", assignee="worker")
+        tid = kb.create_task(conn, title="dashboard-recovery", assignee="worker")
+        kb.link_tasks(conn, parent_id=parent, child_id=tid)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='todo', block_kind='needs_input' WHERE id=?",
+                (tid,),
+            )
+        assert plugin_api._drag_to(conn, tid, "ready")
+        assert kb.get_task(conn, tid).status == "todo"
         assert [e for e in kb.list_events(conn, tid) if e.kind == "unblocked"]
