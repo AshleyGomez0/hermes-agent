@@ -198,3 +198,29 @@ def test_dependency_block_with_open_parent_stays_parked_across_dispatch_tick(
 # ---------------------------------------------------------------------------
 
 
+
+
+def test_needs_input_survives_missing_block_event(kanban_home: Path) -> None:
+    """A persisted needs_input state must not be revived after event pruning."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="legacy-sticky", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='blocked', block_kind='needs_input' WHERE id=?",
+                (tid,),
+            )
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_transient_block_without_event_can_resume(kanban_home: Path) -> None:
+    """Transient restart recovery must continue to work."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="recoverable", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='blocked', block_kind='transient' WHERE id=?",
+                (tid,),
+            )
+        assert kb.recompute_ready(conn) == 1
+        assert kb.get_task(conn, tid).status == "ready"
