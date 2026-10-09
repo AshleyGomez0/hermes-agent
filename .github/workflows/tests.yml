@@ -26,6 +26,9 @@ on:
 permissions:
   contents: read
 
+# CP47 private-fork recovery: standard GitHub runners; full file coverage is
+# preserved through 16 unit and 8 E2E file slices (isolated subprocesses).
+# Do not treat this as evidence of passing until those slices actually run.
 # Cancel in-progress runs for the same ref
 concurrency:
   group: tests-${{ github.ref_type == 'tag' && github.run_id || github.ref }}
@@ -38,13 +41,14 @@ jobs:
     # 3x the price because files contend for the shared machine. Separate machines
     # scale linearly. run_tests_parallel.py partitions from the checkout alone, so
     # both slices agree on the split without a planning job.
-    name: Run tests (${{ matrix.slice }}/2)
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 30
+    name: Run tests (${{ matrix.slice }}/16)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
     strategy:
       fail-fast: false
+      max-parallel: 4
       matrix:
-        slice: [1, 2]
+        slice: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -106,8 +110,8 @@ jobs:
         run: |
           scripts/run_tests.sh
         env:
-          HERMES_TEST_SLICE: ${{ matrix.slice }}/2
-          HERMES_TEST_WORKERS: 32
+          HERMES_TEST_SLICE: ${{ matrix.slice }}/16
+          HERMES_TEST_WORKERS: 2
           HERMES_TEST_FILE_TIMEOUT: 600
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
@@ -129,8 +133,13 @@ jobs:
     # The core suites spawn real serve / gateway / tui_gateway / MCP / SQLite
     # writer processes per test; a 4-vCPU runner serialises them into timeouts.
     if: inputs.e2e
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -189,13 +198,14 @@ jobs:
           scripts/run_tests.sh --include-integration "${files[@]}"
         env:
           HERMES_E2E_STRICT_ACCEPTANCE: ${{ inputs.strict_acceptance }}
+          HERMES_TEST_SLICE: ${{ matrix.shard }}/8
           # An e2e file is a process tree, not one CPU-bound pytest worker. With
           # 32 files at once the hosted run starved live children before their
           # ready frames (empty stderr, still alive) and hit 60–120s deadlines
           # across unrelated SQLite, tenancy, provider and terminal suites.
           # Bound the trees, not the child readiness/turn timeouts. At 4 the
           # PTY turn and serve-SIGTERM deadlines still starved intermittently.
-          HERMES_TEST_WORKERS: "3"
+          HERMES_TEST_WORKERS: "1"
           # Multi-process episodes (torture chamber, compaction kill -9,
           # gateway liveness, delivery exactly-once through a real gateway,
           # the cron virtual-clock soak) legitimately run past the 300 s default.
@@ -250,8 +260,8 @@ jobs:
     # runs ~5-15 min. Sharded by suite directory (see e2e-upgrade-plan).
     name: e2e-upgrade (${{ matrix.shard }})
     needs: e2e-upgrade-plan
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
