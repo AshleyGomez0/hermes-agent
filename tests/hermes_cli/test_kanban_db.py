@@ -551,6 +551,7 @@ def test_respawn_guard_ignores_auth_words_in_crashed_worker_output(kanban_home):
         assert kbd.check_respawn_guard(conn, spawn_failed_id) == "blocker_auth"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="systemd user scope exists only on Linux")
 def test_infrastructure_spawn_refusal_never_charges_the_card(
     kanban_home, monkeypatch, all_assignees_spawnable,
 ):
@@ -801,7 +802,8 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
         capture_output=True,
         text=True,
     ).stdout
-    assert f"worktree {target}" in listed
+    # Git porcelain uses forward slashes on Windows despite native Path spelling.
+    assert f"worktree {target.as_posix()}" in listed.replace("\\", "/")
     assert f"branch refs/heads/{branch}" in listed
 
 
