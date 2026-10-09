@@ -2389,7 +2389,7 @@ def _factory_recover_successes(conn):
     """Run-keyed durable permit survives terminal metadata replacement/restart."""
     import json
     from hermes_cli.provider_capacity import CapacityBreaker
-    rows = conn.execute("SELECT r.id,r.task_id,e.payload FROM task_runs r JOIN task_events e ON e.run_id=r.id AND e.kind='factory_capacity_permit' WHERE r.outcome='completed' AND r.ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM task_events x WHERE x.run_id=r.id AND x.kind='factory_capacity_observed')").fetchall()
+    rows = conn.execute("SELECT r.id,r.task_id,e.payload FROM task_runs r JOIN task_events e ON e.run_id=r.id AND e.kind='factory_capacity_permit' WHERE r.outcome IN ('completed','review_requested','changes_requested') AND r.ended_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM task_events x WHERE x.run_id=r.id AND x.kind='factory_capacity_observed')").fetchall()
     for row in rows:
         context = {}
         if _factory_policy_guard(conn, row['task_id'], context) is not None or not context:

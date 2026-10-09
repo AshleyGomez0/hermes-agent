@@ -117,3 +117,77 @@ def test_routing_policy_uses_config_not_environment(board, monkeypatch, tmp_path
         lambda: {"kanban": {"factory_routing_policy_path": str(policy)}},
     )
     assert kbd._factory_policy_guard(board, tid) is None
+
+
+@pytest.mark.parametrize("outcome", ["completed", "review_requested", "changes_requested"])
+def test_terminal_handoffs_close_current_half_open_probe(board, monkeypatch, tmp_path, outcome):
+    """A valid capacity probe terminates on review handoff as well as DONE."""
+    from hermes_cli.provider_capacity import CapacityBreaker
+
+    owner, provider = "ashley-canary", "openai-codex"
+    ledger = tmp_path / "capacity.sqlite"
+    breaker = CapacityBreaker(ledger, enabled=True)
+    assert breaker.rate_limited(owner, provider, now=1000)
+    permit = breaker.acquire(owner, provider, now=1300)
+    assert permit.allowed and permit.probe_token
+    tid = kb.create_task(board, title="finite quota success", assignee="codex-worker")
+    if outcome == "changes_requested":
+        first = kb.claim_task(board, tid)
+        assert first is not None
+        assert kb.request_review(
+            board, tid, summary="implementation ready", reviewer="astra",
+            expected_run_id=first.current_run_id,
+        )
+        claimed = kb.claim_review_task(board, tid)
+    else:
+        claimed = kb.claim_task(board, tid)
+    assert claimed is not None
+    run_id = claimed.current_run_id
+    dbfile = next(row[2] for row in board.execute("PRAGMA database_list") if row[1] == "main")
+    scope = {
+        "owner": owner, "provider": provider, "ledger": str(ledger),
+        "board": str(Path(dbfile).resolve()), "probe_token": permit.probe_token,
+    }
+    assert breaker.bind_probe(
+        owner, provider, permit.probe_token,
+        board=scope["board"], run_id=str(run_id), now=1301,
+    )
+    with kb.write_txn(board):
+        kb._append_event(board, tid, "factory_capacity_permit", scope, run_id=run_id)
+
+    if outcome == "completed":
+        assert kb.complete_task(
+            board, tid, result="verified", expected_run_id=run_id,
+        )
+    elif outcome == "review_requested":
+        assert kb.request_review(
+            board, tid, summary="reviewable", reviewer="astra",
+            expected_run_id=run_id,
+        )
+    else:
+        assert kb.request_changes(
+            board, tid, reason="changes required", expected_run_id=run_id,
+        )[0]
+    assert board.execute(
+        "SELECT outcome FROM task_runs WHERE id=?", (run_id,),
+    ).fetchone()[0] == outcome
+
+    def policy_guard(_conn, _task_id, context=None):
+        if context is not None:
+            context.update(scope)
+        return None
+
+    monkeypatch.setattr(kbd, "_factory_policy_guard", policy_guard)
+    kbd._factory_recover_successes(board)
+    assert breaker.acquire(owner, provider, now=1302).state == "CLOSED"
+    recorded = [
+        e for e in kb.list_events(board, tid)
+        if e.kind == "factory_capacity_observed" and e.run_id == run_id
+    ]
+    assert len(recorded) == 1
+    assert recorded[0].payload["closed"] is True
+    kbd._factory_recover_successes(board)
+    assert len([
+        e for e in kb.list_events(board, tid)
+        if e.kind == "factory_capacity_observed" and e.run_id == run_id
+    ]) == 1
