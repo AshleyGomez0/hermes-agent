@@ -71,6 +71,17 @@ def _scrub_local_state(conn: sqlite3.Connection) -> None:
     """Strip machine-local runtime state (claims, PIDs, and above all the
     gateway chat ids subscribed to task events). Caller owns the transaction.
     Run on export and again on import (an archive is untrusted input)."""
+    # Preserve reviewer provenance before clearing current_run_id. Re-gate
+    # runnable snapshots too: import must not revive a stale ready/review row.
+    for row in conn.execute(
+        "SELECT id, status FROM tasks WHERE status IN ('running', 'ready', 'review')"
+    ).fetchall():
+        task_id, status = row
+        resume_status = kb._retry_status_for_run(conn, task_id) if status == "running" else status
+        landing = kb._landing_status_after_parents(conn, task_id, resume_status)
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (landing, task_id))
+        if landing == "todo":
+            kb._append_event(conn, task_id, "dependency_wait", {"source_status": resume_status})
     conn.execute("DELETE FROM kanban_notify_subs")
     conn.execute(
         """
@@ -86,9 +97,6 @@ def _scrub_local_state(conn: sqlite3.Connection) -> None:
                last_failure_error   = NULL
         """
     )
-    # A task caught mid-run is not running anywhere the importer can see.
-    # Send it back to the queue rather than shipping a phantom claim.
-    conn.execute("UPDATE tasks SET status = 'ready' WHERE status = 'running'")
     conn.execute(
         """
         UPDATE task_runs
@@ -140,6 +148,7 @@ def export_board(
         # The snapshot is a private file with no other writers, so plain
         # commit/close is enough — no need for the board DB's WAL dance.
         with contextlib.closing(sqlite3.connect(str(staged / "kanban.db"))) as snapshot:
+            snapshot.row_factory = sqlite3.Row
             _scrub_local_state(snapshot)
             snapshot.commit()
             counts = _count_rows(snapshot)
@@ -155,10 +164,7 @@ def export_board(
         attachments = copy_regular_files(kb.attachments_root(slug), staged / "attachments") if include_attachments else 0
         logs = copy_regular_files(kb.worker_logs_dir(slug), staged / "logs") if include_logs else 0
 
-        try:
-            from hermes_cli import __version__ as hermes_version
-        except Exception:
-            hermes_version = ""
+        from hermes_cli.version_info import get_version_info
 
         manifest = {
             "format": ARCHIVE_FORMAT,
@@ -166,7 +172,7 @@ def export_board(
             "board": slug,
             "board_name": meta.get("name") or slug,
             "exported_at": int(time.time()),
-            "hermes_version": str(hermes_version),
+            "hermes_version": get_version_info().base_version,
             "includes": {"attachments": bool(include_attachments), "logs": bool(include_logs)},
             "counts": {**counts, "attachment_files": attachments, "log_files": logs},
         }
@@ -204,7 +210,7 @@ def _read_manifest(root: Path) -> dict[str, Any]:
     if not path.exists():
         raise ValueError("archive is not a Hermes kanban board export (no manifest.json)")
     try:
-        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest = json.loads(path.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError as exc:
         raise ValueError(f"archive manifest is not valid JSON: {exc}") from exc
     if not isinstance(manifest, dict) or manifest.get("format") != ARCHIVE_FORMAT:
@@ -224,7 +230,7 @@ def _read_manifest(root: Path) -> dict[str, Any]:
 def _read_board_metadata(path: Path) -> dict[str, Any]:
     """Read an archive's ``board.json``, tolerating a missing/broken file."""
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError):
         return {}
     return raw if isinstance(raw, dict) else {}
