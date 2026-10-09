@@ -53,6 +53,19 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
 
+      - name: Reclaim unused hosted-runner SDK disk before Python regression
+        # CP47: standard Linux runners run out of disk during update-process
+        # integration tests; these preinstalled SDKs are not used by Python lane.
+        run: |
+          set -euo pipefail
+          df -h . "$RUNNER_TEMP"
+          for sdk in /usr/share/dotnet /usr/local/lib/android /opt/ghc; do
+            if [ -d "$sdk" ]; then
+              sudo rm -rf -- "$sdk"
+            fi
+          done
+          df -h . "$RUNNER_TEMP"
+
       - name: Install ripgrep (prebuilt binary)
         run: |
           set -euo pipefail
@@ -111,7 +124,7 @@ jobs:
           scripts/run_tests.sh
         env:
           HERMES_TEST_SLICE: ${{ matrix.slice }}/16
-          HERMES_TEST_WORKERS: 2
+          HERMES_TEST_WORKERS: 1
           HERMES_TEST_FILE_TIMEOUT: 600
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
