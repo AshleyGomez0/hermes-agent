@@ -324,9 +324,8 @@ def _exited_status(code: int) -> int:
 def test_rate_limit_exit_requeues_without_counting_failure(
     kanban_home, monkeypatch,
 ):
-    """A rate-limit sentinel exit releases the task to ``ready`` and leaves
-    ``consecutive_failures`` untouched — the breaker must never trip on a
-    transient throttle, even across many quota-wall hits."""
+    monkeypatch.setenv("HERMES_KANBAN_QUOTA_HOLD_AFTER", "0")
+    """Quota hold opt-out proves rate limits do not consume failure budget."""
     import hermes_cli.kanban_db as _kb
     from hermes_cli import kanban_db_dispatch as _kbd
 
@@ -382,6 +381,7 @@ def test_rate_limit_exit_requeues_without_counting_failure(
         ]
         assert "rate_limited" in outcomes
         assert "crashed" not in outcomes
+
 
 
 @pytest.mark.parametrize("lane", ["ready", "review"])
