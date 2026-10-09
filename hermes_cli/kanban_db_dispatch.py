@@ -2325,7 +2325,7 @@ def _factory_recover_successes(conn):
             if context is None:
                 continue
             token = permit.get('probe_token')
-            closed = CapacityBreaker(context['ledger'], enabled=True).success(context['owner'], context['provider'], token, now=time.time()) if token else False
+            closed = CapacityBreaker(context['ledger'], enabled=True).success(context['owner'], context['provider'], token, now=time.time(), board=context['board'], run_id=str(row['id'])) if token else False
             with _kb.write_txn(conn):
                 _kb._append_event(conn, row['task_id'], 'factory_capacity_observed', {'closed': closed}, run_id=row['id'])
         except (ValueError, TypeError, KeyError):

@@ -145,8 +145,21 @@ class CapacityBreaker:
         except (sqlite3.Error, ValueError, OSError):
             return False
 
-    def success(self, owner, provider, probe_token, *, now):
+    def success(self, owner, provider, probe_token, *, now, board=None, run_id=None):
+        """Close the probe only for its bound run when called by Factory recovery.
+
+        The owner/provider token alone can appear in another shared-board event.
+        Recovery must not let an unrelated completed run close an active probe.
+        Optional arguments retain the existing direct-library call contract;
+        the Factory dispatcher always supplies both run-fencing identifiers.
+        """
         if not self._valid(owner, provider, now) or not isinstance(probe_token, str) or not probe_token:
+            return False
+        if (board is None) != (run_id is None):
+            return False
+        if board is not None and not all(
+            isinstance(v, str) and v.strip() for v in (board, run_id)
+        ):
             return False
         try:
             with self._transaction() as conn:
@@ -156,6 +169,15 @@ class CapacityBreaker:
                 # generation/token remains current; the CAS fences successors.
                 if row is None or row["state"] != "HALF_OPEN" or row["token"] != probe_token:
                     return False
+                if board is not None:
+                    binding = conn.execute(
+                        "SELECT board,run_id,token FROM capacity_probe_runs "
+                        "WHERE owner=? AND provider=?",
+                        (owner, provider),
+                    ).fetchone()
+                    if (binding is None or binding["token"] != probe_token
+                            or binding["board"] != board or binding["run_id"] != run_id):
+                        return False
                 cur = conn.execute("""UPDATE capacity SET state='CLOSED', eligible_at=0,
                     failures=0, token=NULL,lease_until=0 WHERE owner=? AND provider=?
                     AND generation=? AND token=? AND state='HALF_OPEN'""", (owner, provider, row["generation"], probe_token))

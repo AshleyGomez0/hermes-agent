@@ -281,3 +281,62 @@ def test_writer_probe_closes_after_valid_cross_provider_review_handoff(board, mo
         "SELECT COUNT(*) FROM task_events WHERE task_id=? AND run_id=? "
         "AND kind='factory_capacity_observed'", (tid, run_id),
     ).fetchone()[0] == 1
+
+def test_unrelated_completed_run_cannot_close_live_writer_probe(board, monkeypatch, tmp_path):
+    """A shared board can expose the token; ONLY its bound run may close it."""
+    import json
+    import os
+    from hermes_cli.provider_capacity import CapacityBreaker
+
+    owner = os.path.normcase(str((tmp_path / ".hermes").resolve()))
+    provider = "openai-codex"
+    ledger = tmp_path / "capacity.sqlite"
+    path = tmp_path / "factory-policy.json"
+    db = str(Path(next(r[2] for r in board.execute("PRAGMA database_list") if r[1] == "main")).resolve())
+    breaker = CapacityBreaker(ledger, enabled=True)
+    assert breaker.rate_limited(owner, provider, now=1000)
+    token = breaker.acquire(owner, provider, now=1300).probe_token
+    assert token
+
+    active = kb.create_task(board, title="active live quota probe",
+        assignee="codex-worker", provider_override=provider, model_override="writer-model")
+    unrelated = kb.create_task(board, title="unrelated completed writer",
+        assignee="codex-worker", provider_override=provider, model_override="writer-model")
+    policy = {
+        "schema_version": 1, "enabled": True, "owner_home": owner, "board_db": db,
+        "routes": {
+            "writer": {"provider": provider, "model": "writer-model", "profile": "codex-worker",
+                       "eligible_roles": ["writer"]},
+            "minimax": {"preserved": True},
+        },
+        "require_independent_reviewer": True,
+        "qwen": {"bounded_only": True, "tools": False}, "deterministic": "scripts",
+        "task_roles": {active: {"role": "writer"}, unrelated: {"role": "writer"}},
+        "rollout": {"mode": "task_allowlist", "task_ids": [active, unrelated]},
+    }
+    path.write_text(json.dumps(policy), encoding="utf-8")
+    monkeypatch.setattr(config_module, "load_config",
+        lambda: {"kanban": {"factory_routing_policy_path": str(path)}})
+    actual = kb.claim_task(board, active)
+    assert actual and actual.current_run_id
+    actual_id = actual.current_run_id
+    assert breaker.bind_probe(owner, provider, token, board=db,
+                              run_id=str(actual_id), now=1301)
+    fake = kb.claim_task(board, unrelated)
+    assert fake and fake.current_run_id != actual_id
+    fake_id = fake.current_run_id
+    scope = {"owner": owner, "provider": provider, "ledger": str(ledger),
+             "board": db, "probe_token": token,
+             "model": "writer-model", "profile": "codex-worker", "role": "writer"}
+    with kb.write_txn(board):
+        kb._append_event(board, unrelated, "factory_capacity_permit", scope, run_id=fake_id)
+    assert kb.complete_task(board, unrelated, result='unrelated evidence', expected_run_id=fake_id)
+    assert board.execute("SELECT ended_at FROM task_runs WHERE id=?", (actual_id,)).fetchone()[0] is None
+
+    kbd._factory_recover_successes(board)
+    # The correct state is STILL HALF_OPEN: the bound run is active.
+    assert breaker.acquire(owner, provider, now=1302).state == "HALF_OPEN"
+    observed = board.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+                             "AND kind='factory_capacity_observed'", (unrelated, fake_id)).fetchone()
+    assert observed is not None
+    assert json.loads(observed[0])["closed"] is False
