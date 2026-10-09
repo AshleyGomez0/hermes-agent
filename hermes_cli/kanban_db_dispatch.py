@@ -2126,6 +2126,24 @@ def _factory_policy_guard(conn: sqlite3.Connection, task_id: str, context=None) 
             if not isinstance(roles, list) or not roles or any(r not in ("writer", "read_only", "test_fix", "independent_reviewer") for r in roles):
                 raise ValueError("invalid eligible_roles")
             eligible.append(route)
+        # Existing enabled policies remain globally strict. During a deliberate
+        # rollout an exact task allowlist preserves the legacy dispatch path for
+        # unenrolled work on the shared board. This is never inferred from
+        # title, assignee or project; only explicit task IDs are enrolled.
+        rollout = policy.get("rollout")
+        if rollout is not None:
+            if not isinstance(rollout, dict) or set(rollout) != {"mode", "task_ids"}:
+                raise ValueError("rollout needs exactly mode and task_ids")
+            if rollout.get("mode") != "task_allowlist":
+                raise ValueError("unknown Factory rollout mode")
+            task_ids = rollout.get("task_ids")
+            if (not isinstance(task_ids, list) or not task_ids or len(task_ids) > 128
+                    or any(not isinstance(tid, str) or not tid.startswith("t_")
+                           or len(tid) > 96 for tid in task_ids)
+                    or len(task_ids) != len(set(task_ids))):
+                raise ValueError("rollout task_ids must be unique, bounded and non-empty")
+            if task_id not in task_ids:
+                return None
         contracts = policy.get('task_roles', {})
         contract = contracts.get(task_id) if isinstance(contracts, dict) else None
         if isinstance(contract, str):
