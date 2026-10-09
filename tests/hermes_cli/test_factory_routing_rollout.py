@@ -122,6 +122,19 @@ def test_wrong_board_fails_closed_even_for_unenrolled_task(board, tmp_path, monk
     save()
     assert dispatch._factory_policy_guard(board, legacy) == "factory_policy_invalid"
 
+def test_blocked_independent_reviewer_does_not_freeze_safe_legacy_writer(board, tmp_path, monkeypatch):
+    """A capacity-blocked review is a lateral dependency, not a global stop."""
+    enrolled, legacy, policy, save = configured_policy(board, tmp_path, monkeypatch)
+    policy["task_roles"][enrolled] = {"role": "independent_reviewer"}
+    save()
+    assert kb.block_task(board, enrolled, kind="capability", reason="provider 429")
+    result = dispatch.dispatch_once(board, dry_run=True, max_in_progress=2)
+    planned = {item[0] for item in result.spawned}
+    assert enrolled not in planned
+    assert legacy in planned
+    assert not result.respawn_guarded
+
+
 def test_task_allowlist_dispatches_enrolled_and_legacy_dry_run(board, tmp_path, monkeypatch):
     enrolled, legacy, _, _ = configured_policy(board, tmp_path, monkeypatch)
     result = dispatch.dispatch_once(board, dry_run=True, max_in_progress=2)

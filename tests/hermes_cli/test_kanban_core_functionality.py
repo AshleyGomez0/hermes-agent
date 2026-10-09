@@ -707,6 +707,9 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
         assert pid == 99999
     finally:
         conn.close()
+        # FakePopen is not a real child: never leave its synthetic PID in
+        # the module-wide zombie reaper across test cases.
+        kbd._live_worker_procs.pop(99999, None)
 
     cmd = captured["cmd"]
     assert "--skills" not in cmd, (
