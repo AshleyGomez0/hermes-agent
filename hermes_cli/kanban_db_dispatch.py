@@ -2087,7 +2087,7 @@ def _factory_policy_guard(conn: sqlite3.Connection, task_id: str, context=None) 
         path = Path(explicit)
         if not path.is_file():
             raise ValueError("configured Factory routing policy is missing")
-        policy = json.loads(path.read_text(encoding="utf-8"))
+        policy = json.loads(path.read_text(encoding="utf-8-sig"))
         if not isinstance(policy, dict) or type(policy.get("schema_version")) is not int or policy["schema_version"] != 1:
             raise ValueError("expected schema_version=1")
         if type(policy.get("enabled")) is not bool:

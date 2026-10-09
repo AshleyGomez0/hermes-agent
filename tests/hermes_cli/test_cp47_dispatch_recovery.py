@@ -87,7 +87,7 @@ def test_routing_policy_uses_config_not_environment(board, monkeypatch, tmp_path
 
     # Explicit disabled policy is accepted through config.yaml.
     policy = tmp_path / "route.json"
-    policy.write_text('{"schema_version": 1, "enabled": false}', encoding="utf-8")
+    policy.write_bytes(b'\xef\xbb\xbf' + b'{"schema_version": 1, "enabled": false}')
     monkeypatch.setattr(
         config_module, "load_config",
         lambda: {"kanban": {"factory_routing_policy_path": str(policy)}},
