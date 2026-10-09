@@ -3794,7 +3794,7 @@ def _regate_children_after_parent_archive(conn: sqlite3.Connection, parent_id: s
         "  SELECT l.child_id FROM task_links l JOIN descendants d ON l.parent_id = d.id "
         "  LIMIT ?"
         ") "
-        "SELECT t.id, t.status, t.worker_pid, t.claim_lock, t.worker_started_at "
+        "SELECT t.id, t.status, t.worker_pid, t.claim_lock, t.worker_started_at, t.result, t.completed_at "
         "FROM tasks t JOIN descendants d ON d.id = t.id",
         (parent_id, ARCHIVE_DESCENDANT_LIMIT + 1),
     ).fetchall()
@@ -3808,7 +3808,7 @@ def _regate_children_after_parent_archive(conn: sqlite3.Connection, parent_id: s
         if source_status not in {"done", "ready", "review", "running"}:
             continue
         conn.execute(
-            "UPDATE tasks SET status = 'todo', completed_at = NULL, "
+            "UPDATE tasks SET status = 'todo', completed_at = NULL, result = NULL, "
             "claim_lock = NULL, claim_expires = NULL, "
             "worker_pid = NULL, worker_started_at = NULL WHERE id = ?",
             (child_id,),
@@ -3819,7 +3819,8 @@ def _regate_children_after_parent_archive(conn: sqlite3.Connection, parent_id: s
         )
         _append_event(
             conn, child_id, "dependency_wait",
-            {"parent": parent_id, "parent_status": "archived", "source_status": source_status},
+            {"parent": parent_id, "parent_status": "archived", "source_status": source_status,
+             "historical_result": row["result"], "historical_completed_at": row["completed_at"]},
             run_id=run_id,
         )
         if source_status == "running":
@@ -3829,37 +3830,58 @@ def _regate_children_after_parent_archive(conn: sqlite3.Connection, parent_id: s
 
 
 def reconcile_legacy_archived_parents(conn: sqlite3.Connection, *, signal_fn=None) -> int:
-    """One-shot fail-closed reconciliation of archived-parent closures on old boards.
+    """Reconcile pre-CP46 archived-parent descendants in bounded batches.
 
-    Before CP46 archived parents used to count as successful. An existing board
-    can thus contain completed or runnable descendants that violate today's
-    invariant even though new archive operations now re-gate correctly.
-
-    Called by the owner's schema initialization lock after additive migrations.
-    The existing bounded archive walker writes idempotent transitions under a
-    single transaction. Signal prior running worker PIDs only *after* commit,
-    using the usual claim/PID fingerprint guard.
+    A historical board may contain many thousands of nodes, so first connect
+    must never be bricked by the normal per-archive 1,000-descendant limit.
+    Each BEGIN IMMEDIATE updates at most ARCHIVE_DESCENDANT_LIMIT rows and
+    commits before another batch. Previous completion evidence is preserved in
+    task_events, never left active on a re-opened task.
     """
-    with write_txn(conn):
-        roots = conn.execute(
-            "WITH RECURSIVE closure(root, id) AS ("
-            " SELECT l.parent_id, l.child_id FROM task_links l "
-            " JOIN tasks p ON p.id=l.parent_id WHERE p.status='archived' "
-            " UNION "
-            " SELECT closure.root, l.child_id FROM closure "
-            " JOIN task_links l ON l.parent_id=closure.id"
-            ") "
-            "SELECT DISTINCT closure.root FROM closure "
-            "JOIN tasks t ON t.id=closure.id "
-            "WHERE t.status IN ('done','ready','review','running') "
-            "ORDER BY closure.root"
-        ).fetchall()
-        terminations = []
-        for row in roots:
-            terminations.extend(_regate_children_after_parent_archive(conn, row[0]))
-    for _child_id, pid, claim, started, _run_id in terminations:
-        _terminate_reclaimed_worker(pid, claim, signal_fn=signal_fn, started_at=started)
-    return len(roots)
+    total = 0
+    while True:
+        with write_txn(conn):
+            rows = conn.execute(
+                "WITH RECURSIVE closure(id) AS ("
+                " SELECT l.child_id FROM task_links l "
+                " JOIN tasks p ON p.id=l.parent_id WHERE p.status='archived' "
+                " UNION "
+                " SELECT l.child_id FROM task_links l JOIN closure c ON l.parent_id=c.id"
+                ") SELECT t.id,t.status,t.worker_pid,t.claim_lock,t.worker_started_at,"
+                "t.result,t.completed_at "
+                "FROM tasks t JOIN closure c ON c.id=t.id "
+                "WHERE t.status IN ('done','ready','review','running') "
+                "ORDER BY t.id LIMIT ?",
+                (ARCHIVE_DESCENDANT_LIMIT,),
+            ).fetchall()
+            terminated = []
+            for row in rows:
+                conn.execute(
+                    "UPDATE tasks SET status='todo', completed_at=NULL, result=NULL,"
+                    " claim_lock=NULL,claim_expires=NULL,worker_pid=NULL,"
+                    "worker_started_at=NULL WHERE id=?",
+                    (row["id"],),
+                )
+                run_id = _end_run(
+                    conn,row["id"],outcome="reclaimed",status="reclaimed",
+                    summary="legacy archived dependency reconciliation",
+                )
+                _append_event(conn,row["id"],"dependency_wait",{
+                    "parent_status":"archived","reason":"legacy_archived_ancestor",
+                    "source_status":row["status"],
+                    "historical_result":row["result"],
+                    "historical_completed_at":row["completed_at"],
+                },run_id=run_id)
+                if row["status"]=="running":
+                    terminated.append((row["id"],row["worker_pid"],row["claim_lock"],row["worker_started_at"],run_id))
+        for task_id,pid,claim,started,run_id in terminated:
+            outcome = _terminate_reclaimed_worker(pid,claim,signal_fn=signal_fn,started_at=started)
+            with write_txn(conn):
+                _append_event(conn,task_id,"legacy_dependency_termination",outcome,run_id=run_id)
+        total += len(rows)
+        if len(rows)<ARCHIVE_DESCENDANT_LIMIT:
+            return total
+
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> bool:

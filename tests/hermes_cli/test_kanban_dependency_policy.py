@@ -344,7 +344,7 @@ def test_first_open_reconciles_legacy_archived_completed_closure(board):
     parent = kb.create_task(board, title="legacy parent", assignee="writer")
     status(board, parent, "done")
     child = kb.create_task(board, title="legacy done child", assignee="writer", parents=[parent])
-    assert kb.complete_task(board, child, summary="old work")
+    assert kb.complete_task(board, child, result="original-completed-work", summary="old work")
     grandchild = kb.create_task(board, title="grandchild", assignee="writer", parents=[child])
     assert kb.complete_task(board, grandchild, summary="old downstream")
     assert board.execute("SELECT completed_at FROM tasks WHERE id=?", (child,)).fetchone()[0]
@@ -357,6 +357,9 @@ def test_first_open_reconciles_legacy_archived_completed_closure(board):
             assert kb.get_task(restored, tid).status == "todo"
             assert restored.execute("SELECT completed_at FROM tasks WHERE id=?", (tid,)).fetchone()[0] is None
             assert any(e.kind == "dependency_wait" for e in kb.list_events(restored, tid))
+            assert kb.get_task(restored, tid).result is None
+        waits = [e for e in kb.list_events(restored, child) if e.kind == "dependency_wait"]
+        assert waits[-1].payload["historical_result"] == "original-completed-work"
         assert kb.reconcile_legacy_archived_parents(restored) == 0
         assert kb.get_task(restored, child).status == "todo"
         assert kb.get_task(restored, grandchild).status == "todo"
@@ -370,4 +373,28 @@ def test_archived_parent_clears_historical_completion_timestamp(board):
     assert board.execute("SELECT completed_at FROM tasks WHERE id=?", (child,)).fetchone()[0]
     assert kb.archive_task(board, parent)
     assert kb.get_task(board, child).status == "todo"
+    assert kb.get_task(board, child).result is None
     assert board.execute("SELECT completed_at FROM tasks WHERE id=?", (child,)).fetchone()[0] is None
+
+def test_legacy_oversize_archive_reconciles_in_batches_without_bricking_board(board, monkeypatch):
+    monkeypatch.setattr(kb, "ARCHIVE_DESCENDANT_LIMIT", 2)
+    parent = kb.create_task(board, title="old archived root", assignee="writer")
+    status(board, parent, "done")
+    previous = parent
+    children = []
+    for index in range(5):
+        child = kb.create_task(
+            board,title=f"old completed child {index}",assignee="writer",parents=[previous],
+        )
+        assert kb.complete_task(board, child, result=f"old-result-{index}")
+        children.append(child)
+        previous = child
+    status(board, parent, "archived")  # pre-new-policy database
+    db_path = Path(board.execute("PRAGMA database_list").fetchone()[2])
+    board.close()
+    kbc._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kbc.connect(db_path) as restored:
+        assert all(kb.get_task(restored, tid).status == "todo" for tid in children)
+        assert all(kb.get_task(restored, tid).result is None for tid in children)
+        assert kb.reconcile_legacy_archived_parents(restored) == 0
+        assert restored.execute("PRAGMA quick_check").fetchone()[0] == "ok"
