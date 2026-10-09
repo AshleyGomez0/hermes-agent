@@ -91,6 +91,55 @@ def _is_task_enrolled(policy, task_id):
     return task_id in task_ids
 
 
+def _review_handoff_sha(conn, task_id, reviewer):
+    """Read the last durable writer handoff; never infer a SHA from a title."""
+    run = conn.execute(
+        "SELECT id, profile, metadata FROM task_runs "
+        "WHERE task_id=? AND outcome='review_requested' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if (run is None or not isinstance(run["profile"], str)
+            or not run["profile"].strip() or run["profile"] == reviewer):
+        return None
+    event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? "
+        "AND kind='review_requested' AND run_id=? ORDER BY id DESC LIMIT 1",
+        (task_id, run["id"]),
+    ).fetchone()
+    if event is None:
+        return None
+    try:
+        provenance = json.loads(event["payload"] or "{}")
+        metadata = json.loads(run["metadata"] or "{}")
+    except (TypeError, ValueError):
+        return None
+    if (not isinstance(provenance, dict) or not isinstance(metadata, dict)
+            or provenance.get("implementer") != run["profile"]
+            or provenance.get("reviewer") != reviewer):
+        return None
+    sha = metadata.get("commit")
+    return sha.lower() if isinstance(sha, str) and re.fullmatch(
+        r"[0-9a-fA-F]{40}", sha,
+    ) else None
+
+
+def _review_sha(conn, task_id, contract, reviewer):
+    """Validate explicit external review or verified same-card writer handoff."""
+    writer = contract.get("writer_task_id")
+    if writer == "self":
+        if (contract.get("sha_source") != "writer_handoff"
+                or "reviewed_sha" in contract):
+            return None
+        return _review_handoff_sha(conn, task_id, reviewer)
+    sha = contract.get("reviewed_sha")
+    if (not isinstance(writer, str) or not writer.strip()
+            or writer == task_id or contract.get("sha_source") is not None
+            or not isinstance(sha, str)
+            or re.fullmatch(r"[0-9a-fA-F]{40}", sha) is None):
+        return None
+    return sha.lower()
+
+
 def _task_contract(conn, task_id, policy, eligible, owner, board_db, path, context):
     contracts = policy.get("task_roles", {})
     contract = contracts.get(task_id) if isinstance(contracts, dict) else None
@@ -98,21 +147,30 @@ def _task_contract(conn, task_id, policy, eligible, owner, board_db, path, conte
         contract = {"role": contract}
     if not isinstance(contract, dict):
         return "factory_missing_role_adapter"
-    role = contract.get("role")
-    if role == "independent_reviewer":
-        writer = contract.get("writer_task_id")
-        sha = contract.get("reviewed_sha")
-        if (not isinstance(writer, str) or not writer.strip() or writer == task_id
-                or not isinstance(sha, str) or re.fullmatch(r"[0-9a-fA-F]{40}", sha) is None):
-            return "factory_invalid_review_contract"
-    phase = conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()
-    if phase is not None and phase["status"] == "review" and role != "independent_reviewer":
-        return "factory_invalid_review_contract"
     row = conn.execute(
-        "SELECT provider_override, model_override, assignee FROM tasks WHERE id=?", (task_id,),
+        "SELECT status, provider_override, model_override, assignee "
+        "FROM tasks WHERE id=?", (task_id,),
     ).fetchone()
-    route = next((r for r in eligible if row is not None and tuple(row) ==
-                  (r["provider"], r["model"], r["profile"]) and role in r["eligible_roles"]), None)
+    if row is None:
+        return "factory_route_mismatch"
+    if row["status"] == "review" and "review_phase" in contract:
+        contract = contract["review_phase"]
+        if not isinstance(contract, dict):
+            return "factory_invalid_review_contract"
+    role = contract.get("role")
+    if row["status"] == "review" and role != "independent_reviewer":
+        return "factory_invalid_review_contract"
+    sha = None
+    if role == "independent_reviewer":
+        sha = _review_sha(conn, task_id, contract, row["assignee"])
+        if sha is None:
+            return "factory_invalid_review_contract"
+    route = next((
+        route for route in eligible
+        if (row["provider_override"], row["model_override"], row["assignee"])
+        == (route["provider"], route["model"], route["profile"])
+        and role in route["eligible_roles"]
+    ), None)
     if route is None:
         return "factory_route_mismatch"
     if context is not None:
@@ -122,6 +180,8 @@ def _task_contract(conn, task_id, policy, eligible, owner, board_db, path, conte
             ledger=str(path.resolve().parent / "capacity.sqlite"),
             board=str(Path(board_db).resolve()),
         )
+        if sha is not None:
+            context["reviewed_sha"] = sha
     return None
 
 
