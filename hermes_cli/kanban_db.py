@@ -3893,7 +3893,13 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
             return False
         _delete_task_relations(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        return cur.rowcount == 1
+        deleted = cur.rowcount == 1
+    # Removing an archived parent also removes its dependency edges. Re-gate
+    # surviving children immediately rather than leaving them parked in todo
+    # until an unrelated dispatcher tick (same rule as delete_task).
+    if deleted:
+        recompute_ready(conn)
+    return deleted
 
 
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:

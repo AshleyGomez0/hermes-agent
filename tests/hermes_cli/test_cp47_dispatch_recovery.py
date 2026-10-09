@@ -70,6 +70,30 @@ def test_spawn_quota_requeues_only_live_claim(board):
     assert kb.get_task(board, tid).current_run_id is None
 
 
+def test_archived_parent_purge_releases_only_satisfied_children(board):
+    former_parent = kb.create_task(board, title="completed parent")
+    assert kb.complete_task(board, former_parent, result="done")
+    free_child = kb.create_task(
+        board, title="child after purge", assignee="codex-worker",
+        parents=[former_parent],
+    )
+    pending_parent = kb.create_task(board, title="still unfinished parent")
+    gated_child = kb.create_task(
+        board, title="child with another dependency", assignee="codex-worker",
+        parents=[former_parent, pending_parent],
+    )
+    assert kb.get_task(board, free_child).status == "ready"
+    assert kb.get_task(board, gated_child).status == "todo"
+
+    assert kb.archive_task(board, former_parent)
+    assert kb.get_task(board, free_child).status == "todo"
+    assert kb.delete_archived_task(board, former_parent)
+    assert kb.get_task(board, free_child).status == "ready"
+    assert kb.get_task(board, gated_child).status == "todo"
+    assert kb.complete_task(board, pending_parent, result="done")
+    assert kb.get_task(board, gated_child).status == "ready"
+
+
 def test_routing_policy_uses_config_not_environment(board, monkeypatch, tmp_path):
     poisoned = tmp_path / "poison.json"
     poisoned.write_text("not json", encoding="utf-8")

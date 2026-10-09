@@ -49,6 +49,57 @@ def test_429_opens_shared_owner_provider_quota_and_fences_single_probe(tmp_path)
     assert breaker.acquire("ashley", "minimax", now=1363).state == "CLOSED"
 
 
+def test_stale_half_open_report_does_not_revoke_successor_probe(tmp_path):
+    breaker = CapacityBreaker(tmp_path / "capacity.sqlite", enabled=True)
+    assert breaker.rate_limited("ashley", "minimax", now=1000, board="first")
+    old = breaker.acquire("ashley", "minimax", now=1300)
+    assert old.state == "HALF_OPEN" and old.probe_token
+    assert breaker.bind_probe(
+        "ashley", "minimax", old.probe_token,
+        board="board-a", run_id="123", now=1301,
+    )
+    successor = breaker.acquire(
+        "ashley", "minimax", now=1361,
+        probe_alive=lambda board, run_id: False,
+    )
+    assert successor.allowed and successor.probe_token != old.probe_token
+
+    # The finished old worker is reaped late by another board. Its token must
+    # never replace the next probe's token, even if it observes HTTP 429.
+    assert not breaker.rate_limited(
+        "ashley", "minimax", now=1362, board="board-a",
+        probe_token=old.probe_token,
+    )
+    assert not breaker.rate_limited(
+        "ashley", "minimax", now=1362, board="unfenced",
+    )
+    assert breaker.bind_probe(
+        "ashley", "minimax", successor.probe_token,
+        board="board-b", run_id="124", now=1362,
+    )
+    assert breaker.success("ashley", "minimax", successor.probe_token, now=1363)
+    assert breaker.acquire("ashley", "minimax", now=1364).state == "CLOSED"
+    assert not breaker.rate_limited(
+        "ashley", "minimax", now=1365, probe_token=old.probe_token,
+    )
+
+
+def test_current_probe_can_open_quota_and_previous_token_cannot(tmp_path):
+    breaker = CapacityBreaker(tmp_path / "capacity.sqlite", enabled=True)
+    assert breaker.rate_limited("ashley", "openai-codex", now=1000)
+    current = breaker.acquire("ashley", "openai-codex", now=1300)
+    assert current.state == "HALF_OPEN"
+    assert breaker.rate_limited(
+        "ashley", "openai-codex", now=1301,
+        probe_token=current.probe_token, board="board-a",
+    )
+    assert breaker.acquire("ashley", "openai-codex", now=1302).state == "OPEN"
+    assert not breaker.rate_limited(
+        "ashley", "openai-codex", now=1303,
+        probe_token=current.probe_token,
+    )
+
+
 def test_rate_limited_reset_and_malformed_inputs_fail_closed(tmp_path):
     breaker = CapacityBreaker(tmp_path / "capacity.sqlite", enabled=True)
     assert not breaker.acquire("", "minimax", now=1000).allowed

@@ -115,12 +115,23 @@ class CapacityBreaker:
         except (sqlite3.Error, ValueError, OSError):
             return False
 
-    def rate_limited(self, owner, provider, *, now, board="", reset_at=None):
+    def rate_limited(self, owner, provider, *, now, board="", reset_at=None, probe_token=None):
         if not self._valid(owner, provider, now) or not isinstance(board, str) or (reset_at is not None and not _finite(reset_at)):
             return False
         try:
             with self._transaction() as conn:
                 row = self._row(conn, owner, provider)
+                # Reaper reports can arrive after another board takes over an
+                # expired probe. Never revoke that successor's generation.
+                if probe_token is not None:
+                    if (not isinstance(probe_token, str) or not probe_token
+                            or row is None or row["state"] != "HALF_OPEN"
+                            or row["token"] != probe_token
+                            or not probe_token.startswith(f'{row["generation"]}:')):
+                        return False
+                elif row is not None and row["state"] == "HALF_OPEN":
+                    # An unfenced older CLOSED admission cannot evict a probe.
+                    return False
                 failures = (row["failures"] if row else 0) + 1
                 generation = (row["generation"] if row else 0) + 1
                 backoff = min(3600, 300 * (2 ** min(failures - 1, 4)))

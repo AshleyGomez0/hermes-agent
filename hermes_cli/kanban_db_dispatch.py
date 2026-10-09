@@ -1213,7 +1213,9 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 if capacity_context:
                     from hermes_cli.provider_capacity import CapacityBreaker
                     if not CapacityBreaker(capacity_context['ledger'], enabled=True).rate_limited(
-                            capacity_context['owner'], capacity_context['provider'], now=time.time(), board=capacity_context['board'], reset_at=_factory_reset_at(dead.event_payload)):
+                            capacity_context['owner'], capacity_context['provider'], now=time.time(),
+                            board=capacity_context['board'], reset_at=_factory_reset_at(dead.event_payload),
+                            probe_token=capacity_context.get('probe_token')):
                         continue  # fail closed: never requeue before OPEN is durable
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -2315,7 +2317,7 @@ def _dispatch_lane_task(
         if status == 429:
             from hermes_cli.provider_capacity import CapacityBreaker
             if factory_context and not CapacityBreaker(factory_context['ledger'], enabled=True).rate_limited(
-                    factory_context['owner'], factory_context['provider'], now=time.time(), board=factory_context['board'], reset_at=_factory_reset_at(exc)):
+                    factory_context['owner'], factory_context['provider'], now=time.time(), board=factory_context['board'], reset_at=_factory_reset_at(exc), probe_token=factory_context.get('probe_token')):
                 return False  # keep the claim until OPEN can be persisted
             error = f'HTTP 429 quota wall: {exc}'
             with _kb.write_txn(conn):
