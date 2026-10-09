@@ -2074,13 +2074,19 @@ def _factory_policy_guard(conn: sqlite3.Connection, task_id: str, context=None) 
     """Validate explicit task contracts without mutating assignments or ledger."""
     import json
 
-    explicit = os.environ.get("HERMES_FACTORY_ROUTING_POLICY", "")
-    if not explicit:
-        return None
+    # Behavior belongs to profile config.yaml, never a process-local HERMES_* env.
+    # No policy path means the existing dispatcher route is unchanged.
     try:
+        from hermes_cli.config import load_config
+        kanban_cfg = (load_config() or {}).get("kanban") or {}
+        explicit = kanban_cfg.get("factory_routing_policy_path", "")
+        if explicit in ("", None):
+            return None
+        if not isinstance(explicit, str) or not Path(explicit).is_absolute():
+            raise ValueError("factory_routing_policy_path must be an absolute path")
         path = Path(explicit)
-        if not path.exists():
-            return None  # missing policy preserves the legacy dispatch path
+        if not path.is_file():
+            raise ValueError("configured Factory routing policy is missing")
         policy = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(policy, dict) or type(policy.get("schema_version")) is not int or policy["schema_version"] != 1:
             raise ValueError("expected schema_version=1")
@@ -2313,9 +2319,21 @@ def _dispatch_lane_task(
                 return False  # keep the claim until OPEN can be persisted
             error = f'HTTP 429 quota wall: {exc}'
             with _kb.write_txn(conn):
-                conn.execute("UPDATE tasks SET status=?,claim_lock=NULL,claim_expires=NULL,worker_pid=NULL,worker_started_at=NULL,last_failure_error=? WHERE id=?", (lane, error[:500], claimed.id))
+                # A concurrent archive, dependency invalidation, or handoff may
+                # already have consumed this run. Never resurrect that state.
+                if claimed.current_run_id is None or not claimed.claim_lock:
+                    return False
+                landing = _kb._landing_status_after_parents(conn, claimed.id, lane)
+                updated = conn.execute(
+                    "UPDATE tasks SET status=?, claim_lock=NULL, claim_expires=NULL, "
+                    "worker_pid=NULL, worker_started_at=NULL, last_failure_error=? "
+                    "WHERE id=? AND status='running' AND claim_lock=? AND current_run_id=?",
+                    (landing, error[:500], claimed.id, claimed.claim_lock, claimed.current_run_id),
+                )
+                if updated.rowcount != 1:
+                    return False
                 run_id = _kb._end_run(conn, claimed.id, outcome='rate_limited', status='rate_limited', error=error)
-                _kb._append_event(conn, claimed.id, 'rate_limited', {'status_code': 429, 'retry_status': lane}, run_id=run_id)
+                _kb._append_event(conn, claimed.id, 'rate_limited', {'status_code': 429, 'retry_status': landing}, run_id=run_id)
             result.rate_limited.append(claimed.id)
             return False
         from tools.process_registry import RestartSafeScopeUnavailable

@@ -1897,6 +1897,9 @@ DEFAULT_CONFIG = {
         # Auto-claim tasks in the review column and spawn the assigned profile with the bundled
         # sdlc-review skill. Disable where every review is done manually from the dashboard.
         "review_dispatch": True,
+        # Optional absolute JSON route policy for this home/board. Empty keeps
+        # legacy dispatch; an explicitly configured missing file fails closed.
+        "factory_routing_policy_path": "",
         # Seconds between dispatcher ticks. Lower = snappier pickup; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,
