@@ -151,7 +151,10 @@ class CapacityBreaker:
         try:
             with self._transaction() as conn:
                 row = self._row(conn, owner, provider)
-                if row is None or row["state"] != "HALF_OPEN" or row["token"] != probe_token or now >= row["lease_until"]:
+                # Lease expiry permits a successor only after a verified dead
+                # probe. A successful slow probe can still CLOSE while its
+                # generation/token remains current; the CAS fences successors.
+                if row is None or row["state"] != "HALF_OPEN" or row["token"] != probe_token:
                     return False
                 cur = conn.execute("""UPDATE capacity SET state='CLOSED', eligible_at=0,
                     failures=0, token=NULL,lease_until=0 WHERE owner=? AND provider=?

@@ -49,6 +49,21 @@ def test_429_opens_shared_owner_provider_quota_and_fences_single_probe(tmp_path)
     assert breaker.acquire("ashley", "minimax", now=1363).state == "CLOSED"
 
 
+def test_slow_success_closes_current_probe_after_lease_expiry(tmp_path):
+    breaker = CapacityBreaker(tmp_path / "capacity.sqlite", enabled=True)
+    assert breaker.rate_limited("ashley", "minimax", now=1000)
+    probe = breaker.acquire("ashley", "minimax", now=1300)
+    assert probe.allowed and probe.probe_token
+    assert breaker.bind_probe(
+        "ashley", "minimax", probe.probe_token, board="suini", run_id="slow-42", now=1301,
+    )
+    # The worker remains current despite an expired 60s lease. A competing
+    # attempt would need an explicit dead-run proof to obtain a new token.
+    assert breaker.success("ashley", "minimax", probe.probe_token, now=1362)
+    assert breaker.acquire("ashley", "minimax", now=1363).state == "CLOSED"
+    assert not breaker.success("ashley", "minimax", probe.probe_token, now=1364)
+
+
 def test_stale_half_open_report_does_not_revoke_successor_probe(tmp_path):
     breaker = CapacityBreaker(tmp_path / "capacity.sqlite", enabled=True)
     assert breaker.rate_limited("ashley", "minimax", now=1000, board="first")
