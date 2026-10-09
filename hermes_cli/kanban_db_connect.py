@@ -778,6 +778,9 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
             if resolved not in _INITIALIZED_PATHS:
                 conn.executescript(_kb.SCHEMA_SQL)
                 _migrate_add_optional_columns(conn)
+                # Reconcile pre-CP46 archived-parent successes before this board
+                # becomes dispatchable; no raw-SQL shortcut or stale DONE child.
+                _kb.reconcile_legacy_archived_parents(conn)
                 _INITIALIZED_PATHS.add(resolved)
 
         conn, _ = _open_configured(path, _init_if_needed)

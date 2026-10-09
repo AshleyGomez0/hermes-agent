@@ -3808,7 +3808,8 @@ def _regate_children_after_parent_archive(conn: sqlite3.Connection, parent_id: s
         if source_status not in {"done", "ready", "review", "running"}:
             continue
         conn.execute(
-            "UPDATE tasks SET status = 'todo', claim_lock = NULL, claim_expires = NULL, "
+            "UPDATE tasks SET status = 'todo', completed_at = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, "
             "worker_pid = NULL, worker_started_at = NULL WHERE id = ?",
             (child_id,),
         )
@@ -3824,6 +3825,41 @@ def _regate_children_after_parent_archive(conn: sqlite3.Connection, parent_id: s
         if source_status == "running":
             terminations.append((child_id, row["worker_pid"], row["claim_lock"], row["worker_started_at"], run_id))
     return terminations
+
+
+
+def reconcile_legacy_archived_parents(conn: sqlite3.Connection, *, signal_fn=None) -> int:
+    """One-shot fail-closed reconciliation of archived-parent closures on old boards.
+
+    Before CP46 archived parents used to count as successful. An existing board
+    can thus contain completed or runnable descendants that violate today's
+    invariant even though new archive operations now re-gate correctly.
+
+    Called by the owner's schema initialization lock after additive migrations.
+    The existing bounded archive walker writes idempotent transitions under a
+    single transaction. Signal prior running worker PIDs only *after* commit,
+    using the usual claim/PID fingerprint guard.
+    """
+    with write_txn(conn):
+        roots = conn.execute(
+            "WITH RECURSIVE closure(root, id) AS ("
+            " SELECT l.parent_id, l.child_id FROM task_links l "
+            " JOIN tasks p ON p.id=l.parent_id WHERE p.status='archived' "
+            " UNION "
+            " SELECT closure.root, l.child_id FROM closure "
+            " JOIN task_links l ON l.parent_id=closure.id"
+            ") "
+            "SELECT DISTINCT closure.root FROM closure "
+            "JOIN tasks t ON t.id=closure.id "
+            "WHERE t.status IN ('done','ready','review','running') "
+            "ORDER BY closure.root"
+        ).fetchall()
+        terminations = []
+        for row in roots:
+            terminations.extend(_regate_children_after_parent_archive(conn, row[0]))
+    for _child_id, pid, claim, started, _run_id in terminations:
+        _terminate_reclaimed_worker(pid, claim, signal_fn=signal_fn, started_at=started)
+    return len(roots)
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> bool:

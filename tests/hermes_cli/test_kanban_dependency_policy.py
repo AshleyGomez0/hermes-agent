@@ -338,3 +338,36 @@ def test_archive_refuses_oversized_descendant_closure_without_partial_mutation(b
     assert status(board, first) == "done"
     assert status(board, second) == "done"
     assert status(board, third) == "ready"
+
+def test_first_open_reconciles_legacy_archived_completed_closure(board):
+    """Legacy boards could have DONE descendants of an archived ancestor."""
+    parent = kb.create_task(board, title="legacy parent", assignee="writer")
+    status(board, parent, "done")
+    child = kb.create_task(board, title="legacy done child", assignee="writer", parents=[parent])
+    assert kb.complete_task(board, child, summary="old work")
+    grandchild = kb.create_task(board, title="grandchild", assignee="writer", parents=[child])
+    assert kb.complete_task(board, grandchild, summary="old downstream")
+    assert board.execute("SELECT completed_at FROM tasks WHERE id=?", (child,)).fetchone()[0]
+    status(board, parent, "archived")  # simulate pre-CP46 historical state
+    db_path = Path(board.execute("PRAGMA database_list").fetchone()[2])
+    board.close()
+    kbc._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kbc.connect(db_path) as restored:
+        for tid in (child, grandchild):
+            assert kb.get_task(restored, tid).status == "todo"
+            assert restored.execute("SELECT completed_at FROM tasks WHERE id=?", (tid,)).fetchone()[0] is None
+            assert any(e.kind == "dependency_wait" for e in kb.list_events(restored, tid))
+        assert kb.reconcile_legacy_archived_parents(restored) == 0
+        assert kb.get_task(restored, child).status == "todo"
+        assert kb.get_task(restored, grandchild).status == "todo"
+
+
+def test_archived_parent_clears_historical_completion_timestamp(board):
+    parent = kb.create_task(board, title="succeeded", assignee="writer")
+    assert kb.complete_task(board, parent, summary="done")
+    child = kb.create_task(board, title="child", assignee="writer", parents=[parent])
+    assert kb.complete_task(board, child, summary="done")
+    assert board.execute("SELECT completed_at FROM tasks WHERE id=?", (child,)).fetchone()[0]
+    assert kb.archive_task(board, parent)
+    assert kb.get_task(board, child).status == "todo"
+    assert board.execute("SELECT completed_at FROM tasks WHERE id=?", (child,)).fetchone()[0] is None
