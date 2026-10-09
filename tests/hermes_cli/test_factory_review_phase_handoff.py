@@ -108,3 +108,18 @@ def test_invalid_review_phase_stays_closed(canary):
     save()
     _writer_handoff(conn, tid, metadata={"commit": SHA})
     assert dispatch._factory_policy_guard(conn, tid) == "factory_invalid_review_contract"
+
+def test_missing_latest_writer_event_is_not_filled_from_older_run(canary):
+    conn, tid, _, _ = canary
+    _writer_handoff(conn, tid, metadata={"commit": SHA})
+    conn.execute("DELETE FROM task_events WHERE task_id=? AND kind='review_requested'", (tid,))
+    conn.commit()
+    assert dispatch._factory_policy_guard(conn, tid) == "factory_invalid_review_contract"
+
+
+def test_sha_reader_uses_current_database_assignee_not_caller_claim(canary):
+    from hermes_cli.kanban_factory_policy import _review_handoff_sha
+    conn, tid, _, _ = canary
+    _writer_handoff(conn, tid, metadata={"commit": SHA})
+    assert _review_handoff_sha(conn, tid, "someone-else") is None
+    assert _review_handoff_sha(conn, tid, "astra") == SHA

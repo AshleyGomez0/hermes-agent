@@ -92,29 +92,31 @@ def _is_task_enrolled(policy, task_id):
 
 
 def _review_handoff_sha(conn, task_id, reviewer):
-    """Read the last durable writer handoff; never infer a SHA from a title."""
-    run = conn.execute(
-        "SELECT id, profile, metadata FROM task_runs "
-        "WHERE task_id=? AND outcome='review_requested' ORDER BY id DESC LIMIT 1",
-        (task_id,),
+    """One SQLite snapshot binds the latest writer run, event and assignee."""
+    row = conn.execute(
+        "WITH latest AS (SELECT id, profile, metadata FROM task_runs "
+        "WHERE task_id=? AND outcome='review_requested' "
+        "ORDER BY id DESC LIMIT 1) "
+        "SELECT latest.profile, latest.metadata, "
+        "(SELECT payload FROM task_events WHERE task_id=? "
+        "AND kind='review_requested' AND run_id=latest.id "
+        "ORDER BY id DESC LIMIT 1) AS payload "
+        "FROM latest JOIN tasks ON tasks.id=? "
+        "WHERE tasks.status='review' AND tasks.assignee=?",
+        (task_id, task_id, task_id, reviewer),
     ).fetchone()
-    if (run is None or not isinstance(run["profile"], str)
-            or not run["profile"].strip() or run["profile"] == reviewer):
-        return None
-    event = conn.execute(
-        "SELECT payload FROM task_events WHERE task_id=? "
-        "AND kind='review_requested' AND run_id=? ORDER BY id DESC LIMIT 1",
-        (task_id, run["id"]),
-    ).fetchone()
-    if event is None:
+    if (row is None or not row["payload"]
+            or not isinstance(row["profile"], str)
+            or not row["profile"].strip() or row["profile"] == reviewer):
         return None
     try:
-        provenance = json.loads(event["payload"] or "{}")
-        metadata = json.loads(run["metadata"] or "{}")
+        provenance = json.loads(row["payload"])
+        metadata = json.loads(row["metadata"] or "{}")
     except (TypeError, ValueError):
+        _kb._log.warning("kanban: malformed same-card review provenance for task %s", task_id)
         return None
     if (not isinstance(provenance, dict) or not isinstance(metadata, dict)
-            or provenance.get("implementer") != run["profile"]
+            or provenance.get("implementer") != row["profile"]
             or provenance.get("reviewer") != reviewer):
         return None
     sha = metadata.get("commit")
