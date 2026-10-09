@@ -122,6 +122,23 @@ def test_wrong_board_fails_closed_even_for_unenrolled_task(board, tmp_path, monk
     save()
     assert dispatch._factory_policy_guard(board, legacy) == "factory_policy_invalid"
 
+
+def test_foreign_process_home_fails_closed_before_allowlist_bypass(board, tmp_path, monkeypatch):
+    _, legacy, _, _ = configured_policy(board, tmp_path, monkeypatch)
+    foreign_home = tmp_path / "other-operator" / ".hermes"
+    foreign_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(foreign_home))
+    assert dispatch._factory_policy_guard(board, legacy) == "factory_policy_invalid"
+
+
+def test_same_owner_named_profile_is_allowed(board, tmp_path, monkeypatch):
+    enrolled, _, _, _ = configured_policy(board, tmp_path, monkeypatch)
+    profile_home = tmp_path / ".hermes" / "profiles" / "orchestrator"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    assert dispatch._factory_policy_guard(board, enrolled) is None
+
+
 def test_blocked_independent_reviewer_does_not_freeze_safe_legacy_writer(board, tmp_path, monkeypatch):
     """A capacity-blocked review is a lateral dependency, not a global stop."""
     enrolled, legacy, policy, save = configured_policy(board, tmp_path, monkeypatch)

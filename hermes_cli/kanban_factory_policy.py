@@ -11,6 +11,7 @@ import sqlite3
 from pathlib import Path
 from typing import Optional
 
+from hermes_constants import get_process_hermes_home
 from hermes_cli import kanban_db as _kb
 
 
@@ -42,6 +43,12 @@ def _validate_owner_and_board(conn, policy):
         raise ValueError("owner_home must be an absolute canonical OAuth root")
     if not isinstance(board_db, str) or not Path(board_db).is_absolute():
         raise ValueError("board_db must be absolute")
+    active_home = get_process_hermes_home().resolve()
+    declared_owner = os.path.normcase(str(Path(owner).resolve()))
+    active_root = (active_home.parent.parent
+                   if active_home.parent.name.casefold() == "profiles" else active_home)
+    if declared_owner != os.path.normcase(str(active_root)):
+        raise ValueError("owner_home differs from active Hermes process identity")
     actual = next((r[2] for r in conn.execute("PRAGMA database_list") if r[1] == "main"), "")
     if not actual or Path(actual).resolve() != Path(board_db).resolve():
         raise ValueError("policy board_db differs from this connection")
