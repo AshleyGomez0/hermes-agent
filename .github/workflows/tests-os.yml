@@ -88,9 +88,20 @@ jobs:
             runner: macos-latest
             marker: macos
             slice: 2/2
-          - name: Windows-only tests
+          # Standard Windows x64: isolate slow PowerShell trees per runner and
+          # retain all files via the same deterministic slice contract as macOS.
+          - name: Windows-only tests (1/2)
             runner: windows-latest
             marker: windows
+            slice: 1/2
+            worker_count: '1'
+            file_timeout: '420'
+          - name: Windows-only tests (2/2)
+            runner: windows-latest
+            marker: windows
+            slice: 2/2
+            worker_count: '1'
+            file_timeout: '420'
           - name: Windows-only tests (arm64)
             runner: windows-11-arm
             marker: windows
@@ -187,7 +198,8 @@ jobs:
         env:
           # These files spawn nested PowerShell trees. CPU-count parallelism
           # starves cold child startup before the fixture's idle deadline.
-          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && '2' || '' }}
+          HERMES_TEST_WORKERS: ${{ matrix.worker_count || (matrix.marker == 'windows' && '2' || '') }}
+          HERMES_TEST_FILE_TIMEOUT: ${{ matrix.file_timeout || '300' }}
           HERMES_TEST_SLICE: ${{ matrix.slice || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.
