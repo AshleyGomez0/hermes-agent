@@ -71,6 +71,9 @@ def test_task_allowlist_applies_provider_guard_to_enrolled_only(board, tmp_path,
     context = {}
     assert dispatch._factory_policy_guard(board, enrolled, context) is None
     assert context["provider"] == "openai-codex"
+    assert context["model"] == "gpt-6.1-sol"
+    assert context["profile"] == "codex-worker"
+    assert context["role"] == "read_only"
     assert context["board"] == str(Path(next(
         row[2] for row in board.execute("PRAGMA database_list") if row[1] == "main"
     )).resolve())

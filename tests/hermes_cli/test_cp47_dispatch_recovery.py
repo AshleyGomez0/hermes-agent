@@ -172,12 +172,12 @@ def test_terminal_handoffs_close_current_half_open_probe(board, monkeypatch, tmp
         "SELECT outcome FROM task_runs WHERE id=?", (run_id,),
     ).fetchone()[0] == outcome
 
-    def policy_guard(_conn, _task_id, context=None):
-        if context is not None:
-            context.update(scope)
-        return None
+    from hermes_cli import kanban_factory_policy as factory_policy
 
-    monkeypatch.setattr(kbd, "_factory_policy_guard", policy_guard)
+    def recovery_scope(_conn, _task_id, _run_profile, _permit):
+        return {key: scope[key] for key in ("owner", "provider", "ledger", "board")}
+
+    monkeypatch.setattr(factory_policy, "_factory_recovery_context", recovery_scope)
     kbd._factory_recover_successes(board)
     assert breaker.acquire(owner, provider, now=1302).state == "CLOSED"
     recorded = [
@@ -191,3 +191,93 @@ def test_terminal_handoffs_close_current_half_open_probe(board, monkeypatch, tmp
         e for e in kb.list_events(board, tid)
         if e.kind == "factory_capacity_observed" and e.run_id == run_id
     ]) == 1
+
+
+def test_writer_probe_closes_after_valid_cross_provider_review_handoff(board, monkeypatch, tmp_path):
+    """The writer's half-open probe belongs to its RUN, not the task's new reviewer."""
+    import json
+    import os
+    from hermes_cli.provider_capacity import CapacityBreaker
+
+    owner = os.path.normcase(str((tmp_path / ".hermes").resolve()))
+    provider = "openai-codex"
+    model = "writer-model"
+    ledger = tmp_path / "capacity.sqlite"
+    policy_path = tmp_path / "factory-policy.json"
+    breaker = CapacityBreaker(ledger, enabled=True)
+    assert breaker.rate_limited(owner, provider, now=1000)
+    permit = breaker.acquire(owner, provider, now=1300)
+    assert permit.allowed and permit.probe_token
+
+    tid = kb.create_task(
+        board, title="cross-provider writer completion", assignee="codex-worker",
+        provider_override=provider, model_override=model,
+    )
+    db = next(row[2] for row in board.execute("PRAGMA database_list") if row[1] == "main")
+    policy = {
+        "schema_version": 1, "enabled": True,
+        "owner_home": owner, "board_db": str(Path(db).resolve()),
+        "routes": {
+            "writer": {"provider": provider, "model": model,
+                       "profile": "codex-worker", "eligible_roles": ["writer"]},
+            "minimax": {"preserved": True, "provider": "minimax",
+                       "model": "reviewer-model", "profile": "astra",
+                       "eligible_roles": ["independent_reviewer"]},
+        },
+        "require_independent_reviewer": True,
+        "qwen": {"bounded_only": True, "tools": False}, "deterministic": "scripts",
+        "task_roles": {tid: {"role": "writer", "review_phase": {
+            "role": "independent_reviewer", "writer_task_id": "self",
+            "sha_source": "writer_handoff",
+        }}},
+        "rollout": {"mode": "task_allowlist", "task_ids": [tid]},
+    }
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    monkeypatch.setattr(
+        config_module, "load_config",
+        lambda: {"kanban": {"factory_routing_policy_path": str(policy_path)}},
+    )
+    assert kbd._factory_policy_guard(board, tid) is None
+    claim = kb.claim_task(board, tid)
+    assert claim is not None
+    run_id = claim.current_run_id
+    assert breaker.bind_probe(
+        owner, provider, permit.probe_token, board=str(Path(db).resolve()),
+        run_id=str(run_id), now=1301,
+    )
+    scope = {
+        "owner": owner, "provider": provider, "ledger": str(ledger),
+        "board": str(Path(db).resolve()), "probe_token": permit.probe_token,
+    }
+    with kb.write_txn(board):
+        kb._append_event(board, tid, "factory_capacity_permit", scope, run_id=run_id)
+    assert kb.request_review(
+        board, tid, reviewer="astra", metadata={"commit": "a" * 40},
+        expected_run_id=run_id,
+    )
+    with kb.write_txn(board):
+        board.execute(
+            "UPDATE tasks SET provider_override='minimax', model_override='reviewer-model' "
+            "WHERE id=?", (tid,),
+        )
+    assert kbd._factory_policy_guard(board, tid) is None
+    from hermes_cli.kanban_factory_policy import _factory_recovery_context
+    assert _factory_recovery_context(board, tid, "codex-worker", scope) is not None
+    for key, invalid in (
+        ("owner", "C:/foreign-operator/.hermes"),
+        ("board", str(tmp_path / "other-board.db")),
+        ("ledger", str(tmp_path / "other-capacity.sqlite")),
+        ("provider", "minimax"),
+        ("profile", "astra"),
+        ("model", "reviewer-model"),
+        ("role", "independent_reviewer"),
+    ):
+        forged = {**scope, key: invalid}
+        assert _factory_recovery_context(board, tid, "codex-worker", forged) is None
+    assert _factory_recovery_context(board, tid, "astra", scope) is None
+    kbd._factory_recover_successes(board)
+    assert breaker.acquire(owner, provider, now=1302).state == "CLOSED"
+    assert board.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id=? AND run_id=? "
+        "AND kind='factory_capacity_observed'", (tid, run_id),
+    ).fetchone()[0] == 1

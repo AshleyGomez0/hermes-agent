@@ -186,12 +186,57 @@ def _task_contract(conn, task_id, policy, eligible, owner, board_db, path, conte
         context.update(
             owner=os.path.normcase(str(Path(owner).resolve())),
             provider=route["provider"],
+            model=route["model"],
+            profile=route["profile"],
+            role=role,
             ledger=str(path.resolve().parent / "capacity.sqlite"),
             board=str(Path(board_db).resolve()),
         )
         if sha is not None:
             context["reviewed_sha"] = sha
     return None
+
+
+def _factory_recovery_context(conn, task_id, run_profile, permit):
+    """Revalidate an admission's scope without reading the task's NEW review route.
+
+    The task may have switched assignee/provider after writer handoff.
+    The immutable run-keyed permit, not current task overrides, attributes
+    the writer's successful half-open capacity probe.
+    """
+    try:
+        if not isinstance(permit, dict) or not isinstance(run_profile, str) or not run_profile:
+            return None
+        loaded = _load_policy()
+        if loaded is None:
+            return None
+        policy, path = loaded
+        owner, board_db = _validate_owner_and_board(conn, policy)
+        eligible = _eligible_routes(policy)
+        if not _is_task_enrolled(policy, task_id):
+            return None
+        contracts = policy.get("task_roles")
+        if not isinstance(contracts, dict) or task_id not in contracts:
+            return None
+        route = next((
+            r for r in eligible
+            if r["profile"] == run_profile and r["provider"] == permit.get("provider")
+            and permit.get("model", r["model"]) == r["model"]
+            and permit.get("profile", run_profile) == run_profile
+            and (permit.get("role") is None or permit["role"] in r["eligible_roles"])
+        ), None)
+        if route is None:
+            return None
+        expected = {
+            "owner": os.path.normcase(str(Path(owner).resolve())),
+            "board": str(Path(board_db).resolve()),
+            "ledger": str(path.resolve().parent / "capacity.sqlite"),
+            "provider": route["provider"],
+        }
+        return expected if all(permit.get(k) == v for k, v in expected.items()) else None
+    except (OSError, ValueError, TypeError, AttributeError, sqlite3.Error) as exc:
+        _kb._log.warning("kanban: invalid Factory capacity recovery scope (%s)", exc)
+        return None
 
 
 def _factory_policy_guard(conn: sqlite3.Connection, task_id: str, context=None) -> Optional[str]:
