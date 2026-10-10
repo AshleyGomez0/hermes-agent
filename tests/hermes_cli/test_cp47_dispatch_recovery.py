@@ -125,7 +125,7 @@ def test_terminal_handoffs_close_current_half_open_probe(board, monkeypatch, tmp
     from hermes_cli.provider_capacity import CapacityBreaker
 
     owner, provider = "ashley-canary", "openai-codex"
-    ledger = tmp_path / "capacity.sqlite"
+    ledger = tmp_path / ".hermes" / "capacity.sqlite"
     breaker = CapacityBreaker(ledger, enabled=True)
     assert breaker.rate_limited(owner, provider, now=1000)
     permit = breaker.acquire(owner, provider, now=1300)
@@ -202,7 +202,7 @@ def test_writer_probe_closes_after_valid_cross_provider_review_handoff(board, mo
     owner = os.path.normcase(str((tmp_path / ".hermes").resolve()))
     provider = "openai-codex"
     model = "writer-model"
-    ledger = tmp_path / "capacity.sqlite"
+    ledger = tmp_path / ".hermes" / "capacity.sqlite"
     policy_path = tmp_path / "factory-policy.json"
     breaker = CapacityBreaker(ledger, enabled=True)
     assert breaker.rate_limited(owner, provider, now=1000)
@@ -290,7 +290,7 @@ def test_unrelated_completed_run_cannot_close_live_writer_probe(board, monkeypat
 
     owner = os.path.normcase(str((tmp_path / ".hermes").resolve()))
     provider = "openai-codex"
-    ledger = tmp_path / "capacity.sqlite"
+    ledger = tmp_path / ".hermes" / "capacity.sqlite"
     path = tmp_path / "factory-policy.json"
     db = str(Path(next(r[2] for r in board.execute("PRAGMA database_list") if r[1] == "main")).resolve())
     breaker = CapacityBreaker(ledger, enabled=True)
@@ -306,12 +306,12 @@ def test_unrelated_completed_run_cannot_close_live_writer_probe(board, monkeypat
         "schema_version": 1, "enabled": True, "owner_home": owner, "board_db": db,
         "routes": {
             "writer": {"provider": provider, "model": "writer-model", "profile": "codex-worker",
-                       "eligible_roles": ["writer"]},
+                       "eligible_roles": ["writer", "read_only"]},
             "minimax": {"preserved": True},
         },
         "require_independent_reviewer": True,
         "qwen": {"bounded_only": True, "tools": False}, "deterministic": "scripts",
-        "task_roles": {active: {"role": "writer"}, unrelated: {"role": "writer"}},
+        "task_roles": {active: {"role": "writer"}, unrelated: {"role": "read_only"}},
         "rollout": {"mode": "task_allowlist", "task_ids": [active, unrelated]},
     }
     path.write_text(json.dumps(policy), encoding="utf-8")
@@ -327,7 +327,7 @@ def test_unrelated_completed_run_cannot_close_live_writer_probe(board, monkeypat
     fake_id = fake.current_run_id
     scope = {"owner": owner, "provider": provider, "ledger": str(ledger),
              "board": db, "probe_token": token,
-             "model": "writer-model", "profile": "codex-worker", "role": "writer"}
+             "model": "writer-model", "profile": "codex-worker", "role": "read_only"}
     with kb.write_txn(board):
         kb._append_event(board, unrelated, "factory_capacity_permit", scope, run_id=fake_id)
     assert kb.complete_task(board, unrelated, result='unrelated evidence', expected_run_id=fake_id)

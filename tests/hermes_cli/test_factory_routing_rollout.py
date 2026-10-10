@@ -162,3 +162,41 @@ def test_task_allowlist_dispatches_enrolled_and_legacy_dry_run(board, tmp_path, 
     assert enrolled in planned
     assert legacy in planned
     assert not result.respawn_guarded
+
+
+def test_claim_revalidates_enrolled_policy_inside_sqlite_transaction(board, tmp_path, monkeypatch):
+    """F1: a direct claim cannot bypass an enabled owner/task route policy."""
+    enrolled, legacy, _, _ = configured_policy(board, tmp_path, monkeypatch)
+    with kb.write_txn(board):
+        board.execute("UPDATE tasks SET model_override=NULL WHERE id=?", (enrolled,))
+    assert kb.claim_task(board, enrolled) is None
+    assert kb.get_task(board, enrolled).status == "ready"
+    assert kb.claim_task(board, legacy) is not None
+
+
+def test_claim_rejects_stale_provider_snapshot_even_if_new_route_is_valid(board, tmp_path, monkeypatch):
+    """F1: guard A -> route B before claim must NOT bind A's ledger to B's worker."""
+    enrolled, _, policy, save = configured_policy(board, tmp_path, monkeypatch)
+    guard_context = {}
+    assert dispatch._factory_policy_guard(board, enrolled, guard_context) is None
+    policy["routes"]["other"] = {
+        "profile": "codex-worker", "provider": "minimax", "model": "review-model",
+        "eligible_roles": ["read_only"],
+    }
+    save()
+    with kb.write_txn(board):
+        board.execute(
+            "UPDATE tasks SET provider_override=?, model_override=? WHERE id=?",
+            ("minimax", "review-model", enrolled),
+        )
+    assert dispatch._factory_policy_guard(board, enrolled) is None
+    assert kb.claim_task(board, enrolled, expected_factory_context=guard_context) is None
+    assert kb.get_task(board, enrolled).status == "ready"
+
+
+def test_capacity_ledger_stays_in_ashley_owner_home_not_policy_location(board, tmp_path, monkeypatch):
+    """F8: a policy outside the home must not redirect provider ledger writes."""
+    enrolled, _, _, _ = configured_policy(board, tmp_path, monkeypatch)
+    context = {}
+    assert dispatch._factory_policy_guard(board, enrolled, context) is None
+    assert Path(context["ledger"]).resolve().parent == (tmp_path / ".hermes").resolve()

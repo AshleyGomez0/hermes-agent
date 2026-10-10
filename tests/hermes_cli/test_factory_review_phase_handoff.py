@@ -72,7 +72,11 @@ def test_full_same_card_review_role_automatically_switches_and_tracks_sha(canary
     review = kb.claim_review_task(conn, tid)
     assert review is not None
     assert review.assignee == "astra"
-    assert kb.complete_task(conn, tid, summary="independent exact sha", expected_run_id=review.current_run_id)
+    assert kb.complete_task(
+        conn, tid, summary="independent exact sha",
+        metadata={"reviewed_sha": SHA, "review_verdict": "approved"},
+        expected_run_id=review.current_run_id,
+    )
     assert kb.get_task(conn, tid).status == "done"
 
 
@@ -87,8 +91,14 @@ def test_self_review_is_rejected_even_with_a_sha(canary):
     conn, tid, policy, save = canary
     policy["routes"]["writer"]["eligible_roles"].append("independent_reviewer")
     save()
-    _writer_handoff(conn, tid, reviewer="codex-worker", metadata={"commit": SHA})
-    assert dispatch._factory_policy_guard(conn, tid) == "factory_invalid_review_contract"
+    assert dispatch._factory_policy_guard(conn, tid) is None
+    claimed = kb.claim_task(conn, tid)
+    assert claimed
+    assert not kb.request_review(
+        conn, tid, reviewer="codex-worker", metadata={"commit": SHA},
+        expected_run_id=claimed.current_run_id,
+    )
+    assert kb.get_task(conn, tid).status == "running"
 
 
 def test_tampered_review_event_cannot_bind_sha(canary):
@@ -123,3 +133,100 @@ def test_sha_reader_uses_current_database_assignee_not_caller_claim(canary):
     _writer_handoff(conn, tid, metadata={"commit": SHA})
     assert _review_handoff_sha(conn, tid, "someone-else") is None
     assert _review_handoff_sha(conn, tid, "astra") == SHA
+
+
+def test_cross_provider_review_handoff_swaps_and_restores_overrides(canary):
+    """F4: reviewer route and return-to-writer must be atomic with lifecycle."""
+    conn, tid, policy, save = canary
+    policy["routes"]["minimax"] = {
+        "preserved": True, "provider": "minimax", "model": "review-model",
+        "profile": "astra", "eligible_roles": ["independent_reviewer"],
+    }
+    del policy["routes"]["reviewer"]
+    save()
+    _writer_handoff(conn, tid, metadata={"commit": SHA})
+    row = conn.execute(
+        "SELECT assignee,provider_override,model_override,status FROM tasks WHERE id=?", (tid,),
+    ).fetchone()
+    assert tuple(row) == ("astra", "minimax", "review-model", "review")
+    ctx = {}
+    assert dispatch._factory_policy_guard(conn, tid, ctx) is None
+    assert ctx["provider"] == "minimax" and ctx["reviewed_sha"] == SHA
+    reviewer = kb.claim_review_task(conn, tid)
+    assert reviewer and reviewer.assignee == "astra"
+    ok, writer = kb.request_changes(
+        conn, tid, reason="legitimate reviewer fixes", expected_run_id=reviewer.current_run_id,
+    )
+    assert ok and writer == "codex-worker"
+    row = conn.execute(
+        "SELECT assignee,provider_override,model_override,status FROM tasks WHERE id=?", (tid,),
+    ).fetchone()
+    assert tuple(row) == ("codex-worker", "openai-codex", "canary-model", "ready")
+    assert dispatch._factory_policy_guard(conn, tid) is None
+
+
+def test_enrolled_writer_cannot_skip_independent_review_with_direct_done(canary):
+    """F3: a claimed writer cannot satisfy its own independent-review gate."""
+    conn, tid, _, _ = canary
+    writer = kb.claim_task(conn, tid)
+    assert writer is not None
+    assert not kb.complete_task(
+        conn, tid, result="writer self-certified", expected_run_id=writer.current_run_id,
+    )
+    assert kb.get_task(conn, tid).status == "running"
+
+
+def test_external_review_sha_requires_actual_writer_run_and_commit(canary):
+    """F5: a syntactically valid hash and arbitrary writer_task_id are not proof."""
+    conn, tid, policy, save = canary
+    policy["task_roles"][tid] = {
+        "role": "independent_reviewer", "writer_task_id": "t_missing_writer",
+        "reviewed_sha": SHA,
+    }
+    save()
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status='review',assignee='astra' WHERE id=?", (tid,),
+        )
+    assert dispatch._factory_policy_guard(conn, tid) == "factory_invalid_review_contract"
+
+
+def test_external_sha_requires_completed_writer_run_and_exact_real_checkout(canary, tmp_path):
+    """F5: only exact checkout HEAD with matching writer-run metadata qualifies."""
+    import subprocess
+
+    conn, tid, policy, save = canary
+    repo = tmp_path / "review-repo"
+    repo.mkdir()
+    (repo / "README.md").write_text("proof", encoding="utf-8")
+    def git(*args):
+        return subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True, text=True, timeout=10, check=True,
+        ).stdout.strip()
+    git("init", "-q")
+    git("add", "README.md")
+    git("-c", "user.name=CP47 Test", "-c", "user.email=test@example.invalid",
+        "commit", "-qm", "proof")
+    commit = git("rev-parse", "HEAD")
+    writer = kb.create_task(conn, title="reviewable commit", assignee="codex-worker")
+    claimed = kb.claim_task(conn, writer)
+    assert claimed is not None
+    assert kb.complete_task(
+        conn, writer, result="writer produced commit",
+        metadata={"commit": commit}, expected_run_id=claimed.current_run_id,
+    )
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (str(repo), writer))
+        conn.execute("UPDATE tasks SET status='review',assignee='astra' WHERE id=?", (tid,))
+    policy["task_roles"][tid] = {
+        "role": "independent_reviewer", "writer_task_id": writer,
+        "reviewed_sha": commit, "review_checkout": str(repo.resolve()),
+    }
+    save()
+    context = {}
+    assert dispatch._factory_policy_guard(conn, tid, context) is None
+    assert context["reviewed_sha"] == commit
+    policy["task_roles"][tid]["reviewed_sha"] = "f" * 40
+    save()
+    assert dispatch._factory_policy_guard(conn, tid) == "factory_invalid_review_contract"

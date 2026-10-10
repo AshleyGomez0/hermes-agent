@@ -2175,7 +2175,7 @@ def _claim_and_open_run(
 
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None,
+    claimer: Optional[str] = None, expected_factory_context: Optional[dict] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -2186,6 +2186,8 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if not _factory_claim_allowed(conn, task_id, expected_factory_context):
+            return None
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
@@ -2210,7 +2212,7 @@ def claim_task(
 
 def claim_review_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None,
+    claimer: Optional[str] = None, expected_factory_context: Optional[dict] = None,
 ) -> Optional[Task]:
     """Atomic ``review -> running`` (None when lost). Parents are re-checked
     (one may have reopened meanwhile) and a NEW run tracks the reviewer
@@ -2219,6 +2221,8 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if not _factory_claim_allowed(conn, task_id, expected_factory_context):
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -2679,6 +2683,8 @@ def complete_task(
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
             return False
+        if not _factory_completion_allowed(conn, task_id, expected_run_id, metadata):
+            return False
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
         trow = conn.execute(
@@ -2770,42 +2776,8 @@ def _gate_created_cards(
     return verified_cards
 
 
-def _substantive_text(value: Optional[str]) -> bool:
-    return bool(value is not None and str(value).strip())
-
-
-def _gate_empty_completion(
-    conn: sqlite3.Connection,
-    task_id: str,
-    *,
-    result: Optional[str],
-    summary: Optional[str],
-) -> None:
-    """Refuse a completion that would leave the card with no evidence.
-
-    Review approvals are exempt: a human vouches for the card and
-    ``_REVIEW_APPROVED_NOTE`` is the documented record.
-    """
-    row = conn.execute(
-        "SELECT status, result FROM tasks WHERE id = ?",
-        (task_id,),
-    ).fetchone()
-    if row is None:
-        return
-    if row["status"] == "review":
-        return
-    stored = row["result"]
-    if _substantive_text(result) or _substantive_text(summary) or _substantive_text(stored):
-        return
-    with write_txn(conn):
-        _append_event(
-            conn, task_id, "completion_blocked_empty_result",
-            {
-                "result_preview": _first_line(result, 200) or None,
-                "summary_preview": _first_line(summary, 200) or None,
-            },
-        )
-    raise EmptyCompletionError(task_id)
+from hermes_cli.kanban_db_review_helpers import gate_empty_completion as _gate_empty_completion
+from hermes_cli.kanban_factory_transitions import claim_allowed as _factory_claim_allowed
 
 
 def _stage_completion_artifacts(
@@ -3245,19 +3217,7 @@ def _route_block(
     return "blocked", "blocked", set_sql, (kind, recurrences), payload
 
 
-def redact_review_value(value: Any) -> Any:
-    """Redact secrets at the domain boundary for durable review handoffs."""
-    if isinstance(value, str):
-        from agent.redact import redact_sensitive_text
-
-        return redact_sensitive_text(value, force=True)
-    if isinstance(value, dict):
-        return {key: redact_review_value(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [redact_review_value(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(redact_review_value(item) for item in value)
-    return value
+from hermes_cli.kanban_db_review_helpers import redact_review_value
 
 
 def request_review(
@@ -3341,10 +3301,17 @@ def request_review(
                 implementer = arow["profile"] if arow else None
             if implementer is None and trow["assignee"] != reviewer:
                 implementer = trow["assignee"]
+            from hermes_cli.kanban_factory_transitions import review_routes
+            try:
+                factory_routes = review_routes(conn, task_id, implementer, reviewer)
+            except (ValueError, OSError, sqlite3.Error):
+                return _ret(False, "invalid Factory writer/reviewer route")
             assignee_sql = ", assignee = ?" if reviewer is not None else ""
+            route_sql = ", provider_override = ?, model_override = ?" if factory_routes else ""
             run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
             params: tuple[Any, ...] = (
-                *(() if reviewer is None else (reviewer,)), task_id,
+                *(() if reviewer is None else (reviewer,)),
+                *(factory_routes["reviewer"] if factory_routes else ()), task_id,
                 *(() if expected_run_id is None else (int(expected_run_id),)),
             )
             cur = conn.execute(
@@ -3354,7 +3321,7 @@ def request_review(
                        claim_lock    = NULL,
                        claim_expires = NULL,
                        worker_pid    = NULL
-                """ + assignee_sql + """
+                """ + assignee_sql + route_sql + """
                  WHERE id = ?
                    AND status IN ('running', 'ready')
                 """ + run_guard,
@@ -3378,6 +3345,10 @@ def request_review(
                 "implementer": implementer,
                 "reviewer": reviewer,
             }
+            if factory_routes:
+                payload["writer_route"] = {
+                    "provider": factory_routes["writer"][0], "model": factory_routes["writer"][1],
+                }
             staged = _cleaned_artifact_paths(metadata)
             if staged:
                 payload["artifacts"] = staged
@@ -3389,20 +3360,7 @@ def request_review(
     return _ret(True)
 
 
-def _prior_reviewer(conn: sqlite3.Connection, task_id: str):
-    """Reviewer recorded by the latest ``changes_requested`` run's event.
-    ``None`` = first review (no such run); ``False`` = a run exists but its
-    provenance is missing/malformed."""
-    changes_run = conn.execute(
-        "SELECT id FROM task_runs "
-        "WHERE task_id = ? AND outcome = 'changes_requested' "
-        "ORDER BY id DESC LIMIT 1", (task_id,),
-    ).fetchone()
-    if changes_run is None:
-        return None
-    changes_event = _latest_event(conn, task_id, "changes_requested", changes_run["id"])
-    reviewer = _json_dict(_row_get(changes_event, "payload")).get("reviewer")
-    return reviewer if isinstance(reviewer, str) and reviewer.strip() else False
+from hermes_cli.kanban_db_review_helpers import prior_reviewer as _prior_reviewer, completion_allowed as _factory_completion_allowed
 
 
 def _nonblank_str(value: Any) -> Optional[str]:
@@ -3443,6 +3401,14 @@ def request_changes(
         if implementer is None:
             return False, "review handoff has no valid implementer provenance"
         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
+        from hermes_cli.kanban_factory_transitions import review_routes
+        try:
+            factory_routes = review_routes(
+                conn, task_id, implementer, reviewer, returning=True,
+                origin=_json_dict(requested_event["payload"]),
+            )
+        except (ValueError, OSError, sqlite3.Error):
+            return False, "invalid Factory review rework route"
 
         new_status = _landing_status_after_parents(conn, task_id)
         # consecutive_failures deliberately PRESERVED: a review transition is
@@ -3455,9 +3421,11 @@ def request_changes(
                    claim_lock = NULL,
                    claim_expires = NULL,
                    worker_pid = NULL, worker_started_at = NULL
+            """ + (", provider_override = ?, model_override = ?" if factory_routes else "") + """
              WHERE id = ? AND status = 'running' AND current_run_id = ?
             """,
-            (new_status, implementer, task_id, int(current_run_id)),
+            (new_status, implementer, *(factory_routes["writer"] if factory_routes else ()),
+             task_id, int(current_run_id)),
         )
         if cur.rowcount != 1:
             return False, "task changed during review handoff"

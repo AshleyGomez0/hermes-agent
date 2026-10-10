@@ -115,8 +115,10 @@ class CapacityBreaker:
         except (sqlite3.Error, ValueError, OSError):
             return False
 
-    def rate_limited(self, owner, provider, *, now, board="", reset_at=None, probe_token=None):
+    def rate_limited(self, owner, provider, *, now, board="", reset_at=None, probe_token=None, run_id=None):
         if not self._valid(owner, provider, now) or not isinstance(board, str) or (reset_at is not None and not _finite(reset_at)):
+            return False
+        if run_id is not None and (probe_token is None or not isinstance(run_id, str) or not run_id.strip() or not board.strip()):
             return False
         try:
             with self._transaction() as conn:
@@ -128,6 +130,14 @@ class CapacityBreaker:
                             or row is None or row["state"] != "HALF_OPEN"
                             or row["token"] != probe_token
                             or not probe_token.startswith(f'{row["generation"]}:')):
+                        return False
+                    bound = conn.execute(
+                        "SELECT board,run_id,token FROM capacity_probe_runs WHERE owner=? AND provider=?",
+                        (owner, provider),
+                    ).fetchone()
+                    if bound is not None and (bound["token"] != probe_token or bound["board"] != board or bound["run_id"] != run_id):
+                        return False
+                    if bound is None and run_id is not None:
                         return False
                 elif row is not None and row["state"] == "HALF_OPEN":
                     # An unfenced older CLOSED admission cannot evict a probe.
@@ -164,6 +174,16 @@ class CapacityBreaker:
         try:
             with self._transaction() as conn:
                 row = self._row(conn, owner, provider)
+                # Recovery may crash after CLOSED but before appending its
+                # board event. Only that original bound run may replay success.
+                if row is not None and row["state"] == "CLOSED" and board is not None:
+                    bound = conn.execute(
+                        "SELECT board,run_id,token FROM capacity_probe_runs "
+                        "WHERE owner=? AND provider=?", (owner, provider),
+                    ).fetchone()
+                    return bool(bound is not None and bound["board"] == board
+                                and bound["run_id"] == run_id and bound["token"] == probe_token
+                                and probe_token.startswith(f'{row["generation"]}:'))
                 # Lease expiry permits a successor only after a verified dead
                 # probe. A successful slow probe can still CLOSE while its
                 # generation/token remains current; the CAS fences successors.

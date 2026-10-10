@@ -1183,7 +1183,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
     sweep = _CrashSweep()
     with _kb.write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee, current_run_id "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -1216,7 +1216,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                     if not CapacityBreaker(capacity_context['ledger'], enabled=True).rate_limited(
                             capacity_context['owner'], capacity_context['provider'], now=time.time(),
                             board=capacity_context['board'], reset_at=_factory_reset_at(dead.event_payload),
-                            probe_token=capacity_context.get('probe_token')):
+                            probe_token=capacity_context.get('probe_token'), run_id=str(row['current_run_id']) if capacity_context.get('probe_token') else None):
                         continue  # fail closed: never requeue before OPEN is durable
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -2189,7 +2189,7 @@ def _dispatch_lane_task(
         factory_context.update(probe_token=permit.probe_token,
                                generation=int(permit.probe_token.split(':', 1)[0]) if permit.probe_token else None)
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
-    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
+    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds, expected_factory_context=factory_context)
     if claimed is None:
         return False
     if factory_context:
@@ -2244,7 +2244,7 @@ def _dispatch_lane_task(
         if status == 429:
             from hermes_cli.provider_capacity import CapacityBreaker
             if factory_context and not CapacityBreaker(factory_context['ledger'], enabled=True).rate_limited(
-                    factory_context['owner'], factory_context['provider'], now=time.time(), board=factory_context['board'], reset_at=_factory_reset_at(exc), probe_token=factory_context.get('probe_token')):
+                    factory_context['owner'], factory_context['provider'], now=time.time(), board=factory_context['board'], reset_at=_factory_reset_at(exc), probe_token=factory_context.get('probe_token'), run_id=str(claimed.current_run_id) if factory_context.get('probe_token') else None):
                 return False  # keep the claim until OPEN can be persisted
             error = f'HTTP 429 quota wall: {exc}'
             with _kb.write_txn(conn):

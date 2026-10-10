@@ -137,3 +137,61 @@ def test_unavailable_ledger_denies_admission(tmp_path):
     invalid = CapacityBreaker(tmp_path / "missing" / "capacity.sqlite", enabled=True)
     permit = invalid.acquire("ashley", "minimax", now=1000)
     assert not permit.allowed and permit.state == "INVALID"
+
+
+def test_foreign_board_quota_event_cannot_revoke_live_bound_probe(tmp_path):
+    """An observed 429 with a copied token must belong to its bound run/board."""
+    breaker = CapacityBreaker(tmp_path / "capacity.sqlite", enabled=True)
+    assert breaker.rate_limited("ashley", "openai-codex", now=1000, board="board-A")
+    probe = breaker.acquire("ashley", "openai-codex", now=1300)
+    assert probe.state == "HALF_OPEN" and probe.probe_token
+    assert breaker.bind_probe(
+        "ashley", "openai-codex", probe.probe_token,
+        board="board-A", run_id="run-100", now=1301,
+    )
+    # A different task/board may carry a copied event payload, but it must
+    # not override an active generation or trigger a false global quota hold.
+    assert not breaker.rate_limited(
+        "ashley", "openai-codex", now=1302, board="board-B",
+        probe_token=probe.probe_token,
+    )
+    assert breaker.acquire("ashley", "openai-codex", now=1303).state == "HALF_OPEN"
+    assert not breaker.rate_limited(
+        "ashley", "openai-codex", now=1304, board="board-A",
+        run_id="run-foreign", probe_token=probe.probe_token,
+    )
+    assert breaker.acquire("ashley", "openai-codex", now=1305).state == "HALF_OPEN"
+    assert breaker.rate_limited(
+        "ashley", "openai-codex", now=1306, board="board-A",
+        run_id="run-100", probe_token=probe.probe_token,
+    )
+    assert breaker.acquire("ashley", "openai-codex", now=1307).state == "OPEN"
+
+
+def test_bound_success_replay_is_idempotent_but_cannot_close_other_run(tmp_path):
+    """F7: retry after crash between CLOSED and event append preserves true success."""
+    breaker = CapacityBreaker(tmp_path / "capacity.sqlite", enabled=True)
+    assert breaker.rate_limited("ashley", "openai-codex", now=1000)
+    probe = breaker.acquire("ashley", "openai-codex", now=1300)
+    assert probe.probe_token
+    assert breaker.bind_probe(
+        "ashley", "openai-codex", probe.probe_token, board="board-A", run_id="run-100", now=1301,
+    )
+    assert breaker.success(
+        "ashley", "openai-codex", probe.probe_token,
+        now=1302, board="board-A", run_id="run-100",
+    )
+    # The DB was CLOSED, but the separate Kanban event was not committed yet.
+    assert breaker.success(
+        "ashley", "openai-codex", probe.probe_token,
+        now=1303, board="board-A", run_id="run-100",
+    )
+    assert not breaker.success(
+        "ashley", "openai-codex", probe.probe_token,
+        now=1304, board="board-A", run_id="run-foreign",
+    )
+    assert not breaker.success(
+        "ashley", "openai-codex", probe.probe_token,
+        now=1305, board="board-foreign", run_id="run-100",
+    )
+    assert breaker.acquire("ashley", "openai-codex", now=1306).state == "CLOSED"

@@ -132,6 +132,41 @@ def _review_handoff_sha(conn, task_id, reviewer):
     ) else None
 
 
+def _verified_external_writer(conn, writer, sha, reviewer, contract):
+    """Require an actual completed writer run and an owner-declared exact checkout."""
+    import subprocess
+    checkout = contract.get("review_checkout")
+    if (not isinstance(checkout, str) or not Path(checkout).is_absolute()
+            or not isinstance(writer, str) or not writer.startswith("t_")):
+        return False
+    row = conn.execute(
+        "SELECT status,workspace_path FROM tasks WHERE id=?", (writer,),
+    ).fetchone()
+    if row is None or row["status"] != "done" or not row["workspace_path"]:
+        return False
+    root = Path(checkout).resolve()
+    if not root.is_dir() or root != Path(row["workspace_path"]).resolve():
+        return False
+    run = conn.execute(
+        "SELECT profile,metadata FROM task_runs "
+        "WHERE task_id=? AND outcome='completed' AND ended_at IS NOT NULL "
+        "ORDER BY id DESC LIMIT 1", (writer,),
+    ).fetchone()
+    if run is None or not run["profile"] or run["profile"] == reviewer:
+        return False
+    try:
+        data = json.loads(run["metadata"] or "{}")
+        if not isinstance(data, dict) or data.get("commit") != sha:
+            return False
+        check = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--verify", "HEAD^{commit}"],
+            capture_output=True, text=True, timeout=4, check=False,
+        )
+        return check.returncode == 0 and check.stdout.strip().lower() == sha
+    except (OSError, ValueError, TypeError, subprocess.TimeoutExpired):
+        return False
+
+
 def _review_sha(conn, task_id, contract, reviewer):
     """Validate explicit external review or verified same-card writer handoff."""
     writer = contract.get("writer_task_id")
@@ -146,7 +181,16 @@ def _review_sha(conn, task_id, contract, reviewer):
             or not isinstance(sha, str)
             or re.fullmatch(r"[0-9a-fA-F]{40}", sha) is None):
         return None
-    return sha.lower()
+    return sha.lower() if _verified_external_writer(conn, writer, sha.lower(), reviewer, contract) else None
+
+
+def _owner_capacity_ledger(owner):
+    """Keep the mutable capacity ledger inside the validated owner home."""
+    root = Path(owner).resolve()
+    ledger = root / "capacity.sqlite"
+    if ledger.is_symlink() or (ledger.exists() and ledger.resolve().parent != root):
+        raise ValueError("Factory capacity ledger escapes owner home")
+    return str(ledger)
 
 
 def _task_contract(conn, task_id, policy, eligible, owner, board_db, path, context):
@@ -189,7 +233,7 @@ def _task_contract(conn, task_id, policy, eligible, owner, board_db, path, conte
             model=route["model"],
             profile=route["profile"],
             role=role,
-            ledger=str(path.resolve().parent / "capacity.sqlite"),
+            ledger=_owner_capacity_ledger(owner),
             board=str(Path(board_db).resolve()),
         )
         if sha is not None:
@@ -230,7 +274,7 @@ def _factory_recovery_context(conn, task_id, run_profile, permit):
         expected = {
             "owner": os.path.normcase(str(Path(owner).resolve())),
             "board": str(Path(board_db).resolve()),
-            "ledger": str(path.resolve().parent / "capacity.sqlite"),
+            "ledger": _owner_capacity_ledger(owner),
             "provider": route["provider"],
         }
         return expected if all(permit.get(k) == v for k, v in expected.items()) else None
