@@ -49,6 +49,33 @@ def select_tools(names):
     return set(names) if role is None else set(names) & _ROLE_ALLOWED[role]
 
 
+def board_allowed(board):
+    """A CP47 worker cannot override the dispatcher's pinned board identity.
+
+    Check both the canonical database pin and explicit board slug. The same
+    task id on another board never grants an alternate board read or write.
+    """
+    if active_role() is None:
+        return True
+    from hermes_cli import kanban_db as kb
+
+    db = os.environ.get("HERMES_KANBAN_DB", "")
+    slug = os.environ.get("HERMES_KANBAN_BOARD", "")
+    if not db or not Path(db).is_absolute() or not slug:
+        return False
+    try:
+        pinned_slug = kb._normalize_board_slug(slug)
+        if not pinned_slug or (board is not None and
+                (not isinstance(board, str) or not board.strip() or
+                 kb._normalize_board_slug(board) != pinned_slug)):
+            return False
+        pinned_path = Path(db).resolve()
+        return (pinned_path.is_file()
+                and kb.kanban_db_path(board=pinned_slug).resolve() == pinned_path)
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def _inside_workspace(path):
     root = os.environ.get("HERMES_KANBAN_WORKSPACE")
     if not root or not isinstance(path, str) or not path.strip():
@@ -69,7 +96,8 @@ def allowed_call(name, args):
         return False
     if name.startswith("kanban_"):
         task_id = args.get("task_id")
-        if task_id is not None and task_id != os.environ.get("HERMES_KANBAN_TASK"):
+        if (task_id is not None and task_id != os.environ.get("HERMES_KANBAN_TASK")
+                or not board_allowed(args.get("board"))):
             return False
     if name in {"write_file", "patch"}:
         if name == "patch" and args.get("mode", "replace") != "replace":

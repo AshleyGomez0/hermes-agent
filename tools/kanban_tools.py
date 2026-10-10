@@ -315,6 +315,9 @@ def _board(board: Optional[str], *, quiet_close: bool = False):
     overrides it per call. ``quiet_close`` swallows close() errors (best-effort bridges)."""
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli.kanban_factory_tool_policy import board_allowed
+    if not board_allowed(board):
+        raise _Reject("CP47 worker board scope denied")
     conn = kbc.connect(board=board)
     try:
         yield kb, conn

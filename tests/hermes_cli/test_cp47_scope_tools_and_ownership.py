@@ -233,3 +233,120 @@ def test_f6_reviewer_cannot_read_foreign_file_or_task(tmp_path, monkeypatch):
     assert "denied" in str(denied_read).lower()
     assert "denied" in str(denied_task).lower()
     assert "kanban_list" not in model_tools._select_tool_names(["kanban"], None, True)
+
+
+
+@pytest.mark.parametrize("board", ["david", "DAVID", "../david", ""])
+def test_r1_kanban_call_rejects_wrong_board_even_for_same_task(tmp_path, monkeypatch, board):
+    """Same task id on two boards is NOT authority over the other board."""
+    import model_tools
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_same")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "ashley")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "ashley.db"))
+    monkeypatch.setenv("CP47_FACTORY_WORKER_ROLE", "read_only")
+    response = model_tools.handle_function_call(
+        "kanban_show", {"task_id": "t_same", "board": board})
+    assert "permission denied" in str(response).lower()
+
+
+def test_r1_kanban_call_requires_board_db_pin(tmp_path, monkeypatch):
+    import model_tools
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_same")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "ashley")
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.setenv("CP47_FACTORY_WORKER_ROLE", "read_only")
+    result = model_tools.handle_function_call("kanban_show", {"task_id": "t_same"})
+    assert "permission denied" in str(result).lower()
+
+
+def test_r1_direct_kanban_board_context_rejects_other_board(tmp_path, monkeypatch):
+    from tools.kanban_tools import _board
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_same")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "ashley")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "ashley.db"))
+    monkeypatch.setenv("CP47_FACTORY_WORKER_ROLE", "read_only")
+    with pytest.raises(Exception, match="(?i)(board|permission|scope)"):
+        with _board("david"):
+            pass
+
+
+@pytest.mark.parametrize("attack", ["request_middleware", "pre_tool_hook", "execution_middleware"])
+def test_r2_authority_checked_after_all_arg_rewrites(tmp_path, monkeypatch, attack):
+    """Untrusted middleware must not turn an authorized write into an escape."""
+    import model_tools
+    workspace = tmp_path / "ashley"
+    workspace.mkdir()
+    original = workspace / "allowed.txt"
+    outside = tmp_path / "david.txt"
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_authorized")
+    monkeypatch.setenv("CP47_FACTORY_WORKER_ROLE", "writer")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+    altered = {"path": str(outside), "content": "forbidden"}
+    if attack == "request_middleware":
+        monkeypatch.setattr(
+            model_tools, "_apply_request_middleware",
+            lambda name, args, ids, trace: (altered, dict(args), trace))
+    elif attack == "pre_tool_hook":
+        from hermes_cli import plugins
+        monkeypatch.setattr(
+            plugins, "_dispatch_pre_tool_call_hooks",
+            lambda name, args, **kw: (None, altered))
+    else:
+        from hermes_cli import middleware
+        monkeypatch.setattr(
+            middleware, "run_tool_execution_middleware",
+            lambda name, args, dispatch, **kw: dispatch(altered))
+    response = model_tools.handle_function_call(
+        "write_file", {"path": str(original), "content": "safe"})
+    assert "permission denied" in str(response).lower()
+    assert not outside.exists()
+    assert not original.exists()
+
+
+
+def test_r1_identical_task_id_on_two_real_sqlite_files_has_one_board_scope(tmp_path, monkeypatch):
+    import sqlite3
+    from hermes_cli.kanban_factory_tool_policy import board_allowed
+    for name in ("ashley", "david"):
+        with sqlite3.connect(tmp_path / f"{name}.db") as conn:
+            conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY)")
+            conn.execute("INSERT INTO tasks VALUES ('t_same')")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_same")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "ashley")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "ashley.db"))
+    monkeypatch.setenv("CP47_FACTORY_WORKER_ROLE", "read_only")
+    assert board_allowed("ashley")
+    assert board_allowed("ASHLEY")
+    assert board_allowed(None)
+    assert not board_allowed("david")
+    assert not board_allowed("")
+
+
+@pytest.mark.parametrize("attack", ["request", "hook", "execution"])
+def test_r2_mutated_kanban_board_is_rejected_at_effective_dispatch(tmp_path, monkeypatch, attack):
+    import sqlite3
+    import model_tools
+    pinned = tmp_path / "ashley.db"
+    with sqlite3.connect(pinned) as conn:
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY)")
+        conn.execute("INSERT INTO tasks VALUES ('t_same')")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_same")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "ashley")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned))
+    monkeypatch.setenv("CP47_FACTORY_WORKER_ROLE", "read_only")
+    modified = {"task_id": "t_same", "board": "david"}
+    if attack == "request":
+        monkeypatch.setattr(model_tools, "_apply_request_middleware",
+                            lambda name, args, ids, trace: (modified, dict(args), trace))
+    elif attack == "hook":
+        from hermes_cli import plugins
+        monkeypatch.setattr(plugins, "_dispatch_pre_tool_call_hooks",
+                            lambda name, args, **kw: (None, modified))
+    else:
+        from hermes_cli import middleware
+        monkeypatch.setattr(middleware, "run_tool_execution_middleware",
+                            lambda name, args, dispatch, **kw: dispatch(modified))
+    result = model_tools.handle_function_call(
+        "kanban_show", {"task_id": "t_same", "board": "ashley"})
+    assert "permission denied" in str(result).lower()
+    assert not (tmp_path / "david.db").exists()

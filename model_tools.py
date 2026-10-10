@@ -833,6 +833,12 @@ def _execute_tool(function_name: str, function_args: dict[str, Any], original_ar
         dispatch_kwargs["user_task"] = user_task
 
     def _dispatch(next_args: dict[str, Any]) -> Any:
+        # Last authorization boundary: middleware and pre-tool hooks may have
+        # rewritten the path, board, task id or other arguments since admission.
+        from hermes_cli.kanban_factory_tool_policy import active_role, allowed_call
+        if active_role() is not None and (
+                not isinstance(next_args, dict) or not allowed_call(function_name, next_args)):
+            return tool_error("CP47 role permission denied")
         from tools.connectors import dispatch_connector_call, is_connector_name
         if is_connector_name(function_name):
             return dispatch_connector_call(function_name, next_args, ids.tool_call_id)
