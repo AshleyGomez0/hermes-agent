@@ -18,6 +18,7 @@ def board(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr(dispatch, "_profile_exists_fn", lambda: lambda _name: True)
+    monkeypatch.setattr(dispatch, "_dispatch_profile_allowlist", lambda normalize: frozenset({"codex-worker"}))
     monkeypatch.setattr(config_module, "load_config", lambda: {"kanban": {}})
     kb.init_db()
     with kbc.connect() as conn:
@@ -51,9 +52,12 @@ def configured_policy(board, tmp_path, monkeypatch):
         "qwen": {"bounded_only": True, "tools": False},
         "deterministic": "scripts",
         "task_roles": {enrolled: {"role": "read_only"}},
+        "task_owners": {enrolled: str((tmp_path / ".hermes").resolve()),
+                        legacy: str((tmp_path / ".hermes").resolve())},
+        "dispatch_profiles": ["codex-worker"],
         "rollout": {"mode": "task_allowlist", "task_ids": [enrolled]},
     }
-    path = tmp_path / "factory-policy.json"
+    path = tmp_path / ".hermes" / "factory-policy.json"
     monkeypatch.setattr(
         config_module, "load_config",
         lambda: {"kanban": {"factory_routing_policy_path": str(path)}},

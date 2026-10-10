@@ -203,7 +203,8 @@ def test_writer_probe_closes_after_valid_cross_provider_review_handoff(board, mo
     provider = "openai-codex"
     model = "writer-model"
     ledger = tmp_path / ".hermes" / "capacity.sqlite"
-    policy_path = tmp_path / "factory-policy.json"
+    policy_path = tmp_path / ".hermes" / "factory-policy.json"
+    monkeypatch.setattr(kbd, "_dispatch_profile_allowlist", lambda normalize: frozenset({"codex-worker", "astra"}))
     breaker = CapacityBreaker(ledger, enabled=True)
     assert breaker.rate_limited(owner, provider, now=1000)
     permit = breaker.acquire(owner, provider, now=1300)
@@ -226,6 +227,8 @@ def test_writer_probe_closes_after_valid_cross_provider_review_handoff(board, mo
         },
         "require_independent_reviewer": True,
         "qwen": {"bounded_only": True, "tools": False}, "deterministic": "scripts",
+        "task_owners": {tid: owner},
+        "dispatch_profiles": ["codex-worker", "astra"],
         "task_roles": {tid: {"role": "writer", "review_phase": {
             "role": "independent_reviewer", "writer_task_id": "self",
             "sha_source": "writer_handoff",
@@ -291,7 +294,8 @@ def test_unrelated_completed_run_cannot_close_live_writer_probe(board, monkeypat
     owner = os.path.normcase(str((tmp_path / ".hermes").resolve()))
     provider = "openai-codex"
     ledger = tmp_path / ".hermes" / "capacity.sqlite"
-    path = tmp_path / "factory-policy.json"
+    path = tmp_path / ".hermes" / "factory-policy.json"
+    monkeypatch.setattr(kbd, "_dispatch_profile_allowlist", lambda normalize: frozenset({"codex-worker"}))
     db = str(Path(next(r[2] for r in board.execute("PRAGMA database_list") if r[1] == "main")).resolve())
     breaker = CapacityBreaker(ledger, enabled=True)
     assert breaker.rate_limited(owner, provider, now=1000)
@@ -311,6 +315,8 @@ def test_unrelated_completed_run_cannot_close_live_writer_probe(board, monkeypat
         },
         "require_independent_reviewer": True,
         "qwen": {"bounded_only": True, "tools": False}, "deterministic": "scripts",
+        "task_owners": {active: owner, unrelated: owner},
+        "dispatch_profiles": ["codex-worker"],
         "task_roles": {active: {"role": "writer"}, unrelated: {"role": "read_only"}},
         "rollout": {"mode": "task_allowlist", "task_ids": [active, unrelated]},
     }

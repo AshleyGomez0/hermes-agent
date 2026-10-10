@@ -17,9 +17,10 @@ def canary(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr(dispatch, "_profile_exists_fn", lambda: lambda _: True)
+    monkeypatch.setattr(dispatch, "_dispatch_profile_allowlist", lambda normalize: frozenset({"codex-worker", "astra"}))
     kb.init_db()
     with kbc.connect() as conn:
-        path = tmp_path / "factory.json"
+        path = home / "factory.json"
         board_db = next(r[2] for r in conn.execute("PRAGMA database_list") if r[1] == "main")
         tid = kb.create_task(conn, title="automated review contract",
                              assignee="codex-worker", provider_override="openai-codex",
@@ -37,6 +38,8 @@ def canary(tmp_path, monkeypatch):
             "require_independent_reviewer": True,
             "qwen": {"bounded_only": True, "tools": False},
             "deterministic": "scripts",
+            "task_owners": {tid: str(home.resolve())},
+            "dispatch_profiles": ["codex-worker", "astra"],
             "task_roles": {
                 tid: {"role": "writer", "review_phase": {
                     "role": "independent_reviewer",
@@ -210,6 +213,8 @@ def test_external_sha_requires_completed_writer_run_and_exact_real_checkout(cana
         "commit", "-qm", "proof")
     commit = git("rev-parse", "HEAD")
     writer = kb.create_task(conn, title="reviewable commit", assignee="codex-worker")
+    policy["task_owners"][writer] = policy["owner_home"]
+    save()
     claimed = kb.claim_task(conn, writer)
     assert claimed is not None
     assert kb.complete_task(

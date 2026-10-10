@@ -33,6 +33,18 @@ def _load_policy():
         raise ValueError("expected schema_version=1")
     if type(policy.get("enabled")) is not bool:
         raise ValueError("enabled must be boolean")
+    if policy["enabled"]:
+        # Resolve junctions, symlinks and case-normalised path aliases. Owner
+        # identity is revalidated against the process in _validate_owner_and_board.
+        owner = policy.get("owner_home")
+        if not isinstance(owner, str) or not Path(owner).is_absolute():
+            raise ValueError("policy lacks canonical owner_home")
+        root = Path(owner).resolve()
+        resolved = path.resolve()
+        if root not in resolved.parents or resolved == root:
+            raise ValueError("Factory policy escapes owner home")
+        if path.is_symlink():
+            raise ValueError("Factory policy is a symlink")
     return (policy, path) if policy["enabled"] else None
 
 
@@ -58,6 +70,15 @@ def _validate_owner_and_board(conn, policy):
     if (not isinstance(qwen, dict) or qwen.get("bounded_only") is not True
             or qwen.get("tools") is not False or policy.get("deterministic") != "scripts"):
         raise ValueError("bounded Qwen / deterministic scripts policy required")
+    # A shared board has no implicit tenant ownership for legacy cards.
+    # Explicit per-task declarations and per-home dispatch profile allowlists
+    # are mandatory while task-scoped CP47 policy is enabled.
+    owners = policy.get("task_owners")
+    profiles = policy.get("dispatch_profiles")
+    if (not isinstance(owners, dict) or not isinstance(profiles, list) or
+            not profiles or any(not isinstance(p, str) or not p.strip() for p in profiles)):
+        raise ValueError("Factory policy requires task_owners and dispatch_profiles")
+    _owner_capacity_ledger(owner)
     return owner, board_db
 
 
@@ -292,6 +313,20 @@ def _factory_policy_guard(conn: sqlite3.Connection, task_id: str, context=None) 
         policy, path = loaded
         owner, board_db = _validate_owner_and_board(conn, policy)
         eligible = _eligible_routes(policy)
+        row = conn.execute("SELECT assignee FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if row is None or not isinstance(row["assignee"], str):
+            return "factory_owner_unapproved"
+        task_owners = policy["task_owners"]
+        declared = task_owners.get(task_id)
+        if (not isinstance(declared, str) or not Path(declared).is_absolute()
+                or os.path.normcase(str(Path(declared).resolve())) != os.path.normcase(str(Path(owner).resolve()))
+                or row["assignee"] not in policy["dispatch_profiles"]):
+            return "factory_owner_unapproved"
+        from hermes_cli.kanban_db_dispatch import _dispatch_profile_allowlist
+        from hermes_cli.profiles import normalize_profile_name
+        allowlist = _dispatch_profile_allowlist(normalize_profile_name)
+        if allowlist is None or row["assignee"] not in allowlist:
+            return "factory_owner_unapproved"
         if not _is_task_enrolled(policy, task_id):
             return None
         return _task_contract(conn, task_id, policy, eligible, owner, board_db, path, context)

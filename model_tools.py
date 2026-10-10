@@ -334,7 +334,8 @@ def _select_tool_names(enabled_toolsets: Optional[list[str]], disabled_toolsets:
     # disabled toolset are strictly stripped out. See issue #17309.
     if disabled_toolsets:
         _apply_toolset_selection(tools, disabled_toolsets, quiet_mode, disable=True)
-    return tools
+    from hermes_cli.kanban_factory_tool_policy import select_tools
+    return select_tools(tools)
 
 
 # --- Dynamic schema rewrites -------------------------------------------------
@@ -890,6 +891,9 @@ def handle_function_call(
         function_args = {}
     trace = list(tool_request_middleware_trace or [])
     function_name = _LEGACY_TOOL_ALIASES.get(function_name, function_name)
+    from hermes_cli.kanban_factory_tool_policy import allowed_call
+    if not allowed_call(function_name, function_args):
+        return tool_error('CP47 role permission denied')
     ids = _CallIds(task_id, session_id, tool_call_id, turn_id, api_request_id)
     start = time.monotonic()
 
