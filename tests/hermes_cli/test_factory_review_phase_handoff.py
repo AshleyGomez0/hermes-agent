@@ -12,8 +12,25 @@ SHA = "abcdef0123456789abcdef0123456789abcdef01"
 
 @pytest.fixture()
 def canary(tmp_path, monkeypatch):
+    import subprocess
+    import sys
     home = tmp_path / ".hermes"
     home.mkdir()
+    checkout = home / "owned-review-checkout"
+    checkout.mkdir()
+    (checkout / "proof.txt").write_text("real writer checkout", encoding="utf-8")
+    def git(*argv):
+        return subprocess.run(
+            ["git", "-C", str(checkout), *argv],
+            capture_output=True, text=True, timeout=10, check=True,
+        ).stdout.strip()
+    git("init", "-q")
+    git("add", "proof.txt")
+    git("-c", "user.name=CP47 Fixture", "-c", "user.email=test@example.invalid",
+        "commit", "-qm", "real fixture commit")
+    # Fixture-scoped test SHA must be a real object; the F10 negative cases
+    # independently supply fabricated or stale SHA values.
+    monkeypatch.setattr(sys.modules[__name__], "SHA", git("rev-parse", "HEAD"))
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr(dispatch, "_profile_exists_fn", lambda: lambda _: True)
@@ -25,6 +42,9 @@ def canary(tmp_path, monkeypatch):
         tid = kb.create_task(conn, title="automated review contract",
                              assignee="codex-worker", provider_override="openai-codex",
                              model_override="canary-model")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
+                         (str(checkout.resolve()), tid))
         policy = {
             "schema_version": 1, "enabled": True,
             "owner_home": str(home.resolve()), "board_db": str(Path(board_db).resolve()),
@@ -43,7 +63,8 @@ def canary(tmp_path, monkeypatch):
             "task_roles": {
                 tid: {"role": "writer", "review_phase": {
                     "role": "independent_reviewer",
-                    "writer_task_id": "self", "sha_source": "writer_handoff"
+                    "writer_task_id": "self", "sha_source": "writer_handoff",
+                    "review_checkout": str(checkout.resolve()),
                 }}
             },
             "rollout": {"mode": "task_allowlist", "task_ids": [tid]},
@@ -86,8 +107,12 @@ def test_full_same_card_review_role_automatically_switches_and_tracks_sha(canary
 @pytest.mark.parametrize("metadata", [None, {}, {"commit": "old-sha"}, {"commit": 123}])
 def test_review_without_proven_exact_sha_fails_closed(canary, metadata):
     conn, tid, _, _ = canary
-    _writer_handoff(conn, tid, metadata=metadata)
-    assert dispatch._factory_policy_guard(conn, tid) == "factory_invalid_review_contract"
+    writer = kb.claim_task(conn, tid)
+    assert writer is not None
+    assert not kb.request_review(
+        conn, tid, reviewer="astra", metadata=metadata,
+        expected_run_id=writer.current_run_id)
+    assert kb.get_task(conn, tid).status == "running"
 
 
 def test_self_review_is_rejected_even_with_a_sha(canary):
@@ -119,8 +144,12 @@ def test_invalid_review_phase_stays_closed(canary):
                                                   "writer_task_id": "self",
                                                   "reviewed_sha": SHA}
     save()
-    _writer_handoff(conn, tid, metadata={"commit": SHA})
-    assert dispatch._factory_policy_guard(conn, tid) == "factory_invalid_review_contract"
+    writer = kb.claim_task(conn, tid)
+    assert writer is not None
+    assert not kb.request_review(
+        conn, tid, reviewer="astra", metadata={"commit": SHA},
+        expected_run_id=writer.current_run_id)
+    assert kb.get_task(conn, tid).status == "running"
 
 def test_missing_latest_writer_event_is_not_filled_from_older_run(canary):
     conn, tid, _, _ = canary
@@ -235,3 +264,150 @@ def test_external_sha_requires_completed_writer_run_and_exact_real_checkout(cana
     policy["task_roles"][tid]["reviewed_sha"] = "f" * 40
     save()
     assert dispatch._factory_policy_guard(conn, tid) == "factory_invalid_review_contract"
+
+
+# F10 adversarial regression: a syntactically valid SHA is never provenance.
+def _f10_git_checkout(canary, *, external_owner=False):
+    import subprocess
+    conn, tid, policy, save = canary
+    home = Path(policy["owner_home"])
+    root = home.parent / "unapproved-checkout" if external_owner else home / "approved-checkout"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "proof.txt").write_text("writer result", encoding="utf-8")
+
+    def git(*argv):
+        result = subprocess.run(
+            ["git", "-C", str(root), *argv],
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+        return result.stdout.strip()
+
+    git("init", "-q")
+    git("add", "proof.txt")
+    git("-c", "user.name=CP47 Fixture", "-c", "user.email=test@example.invalid",
+        "commit", "-qm", "writer")
+    commit = git("rev-parse", "HEAD")
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET workspace_path=?, workspace_kind='dir' WHERE id=?",
+                     (str(root.resolve()), tid))
+    policy["task_roles"][tid]["review_phase"]["review_checkout"] = str(root.resolve())
+    save()
+    return root, commit, git
+
+
+def test_f10_invented_sha_without_checkout_denied_at_writer_handoff(canary):
+    conn, tid, policy, save = canary
+    policy["task_roles"][tid]["review_phase"].pop("review_checkout")
+    save()
+    writer = kb.claim_task(conn, tid)
+    assert writer is not None
+    assert not kb.request_review(
+        conn, tid, reviewer="astra", metadata={"commit": SHA},
+        expected_run_id=writer.current_run_id)
+    assert kb.get_task(conn, tid).status == "running"
+
+
+def test_f10_nonexistent_hex_commit_denied_at_handoff(canary):
+    conn, tid, _, _ = canary
+    root, actual, _ = _f10_git_checkout(canary)
+    nonexistent = "f" * 40 if actual != "f" * 40 else "e" * 40
+    writer = kb.claim_task(conn, tid)
+    assert writer is not None
+    assert not kb.request_review(
+        conn, tid, reviewer="astra", metadata={"commit": nonexistent},
+        expected_run_id=writer.current_run_id)
+    assert kb.get_task(conn, tid).status == "running"
+
+
+def test_f10_wrong_checkout_denied_at_handoff(canary):
+    conn, tid, policy, save = canary
+    root, commit, _ = _f10_git_checkout(canary)
+    alternate = root.parent / "other-checkout"
+    alternate.mkdir()
+    policy["task_roles"][tid]["review_phase"]["review_checkout"] = str(alternate.resolve())
+    save()
+    writer = kb.claim_task(conn, tid)
+    assert writer is not None
+    assert not kb.request_review(
+        conn, tid, reviewer="astra", metadata={"commit": commit},
+        expected_run_id=writer.current_run_id)
+    assert kb.get_task(conn, tid).status == "running"
+
+
+def test_f10_head_drift_denied_at_reviewer_claim(canary):
+    conn, tid, policy, save = canary
+    root, commit, git = _f10_git_checkout(canary)
+    _writer_handoff(conn, tid, metadata={"commit": commit})
+    (root / "proof.txt").write_text("second commit", encoding="utf-8")
+    git("add", "proof.txt")
+    git("-c", "user.name=CP47 Fixture", "-c", "user.email=test@example.invalid",
+        "commit", "-qm", "changed after handoff")
+    assert git("rev-parse", "HEAD") != commit
+    assert dispatch._factory_policy_guard(conn, tid) == "factory_invalid_review_contract"
+    assert kb.claim_review_task(conn, tid) is None
+
+
+def test_f10_unapproved_owner_checkout_denied_at_handoff(canary):
+    conn, tid, policy, save = canary
+    root, commit, _ = _f10_git_checkout(canary, external_owner=True)
+    writer = kb.claim_task(conn, tid)
+    assert writer is not None
+    assert not kb.request_review(
+        conn, tid, reviewer="astra", metadata={"commit": commit},
+        expected_run_id=writer.current_run_id)
+    assert kb.get_task(conn, tid).status == "running"
+
+
+def test_f10_head_drift_denied_at_final_completion(canary):
+    conn, tid, policy, save = canary
+    root, commit, git = _f10_git_checkout(canary)
+    _writer_handoff(conn, tid, metadata={"commit": commit})
+    reviewer = kb.claim_review_task(conn, tid)
+    assert reviewer is not None
+    (root / "proof.txt").write_text("new head", encoding="utf-8")
+    git("add", "proof.txt")
+    git("-c", "user.name=CP47 Fixture", "-c", "user.email=test@example.invalid",
+        "commit", "-qm", "drift while reviewing")
+    assert not kb.complete_task(
+        conn, tid, summary="looks good",
+        metadata={"reviewed_sha": commit, "review_verdict": "approved"},
+        expected_run_id=reviewer.current_run_id)
+    assert kb.get_task(conn, tid).status == "running"
+
+
+def test_f10_handoff_requires_explicit_writer_run_provenance(canary):
+    conn, tid, _, _ = canary
+    writer = kb.claim_task(conn, tid)
+    assert writer is not None
+    assert not kb.request_review(
+        conn, tid, reviewer="astra", metadata={"commit": SHA},
+        expected_run_id=None)
+    assert kb.get_task(conn, tid).status == "running"
+
+
+def test_f10_dirty_checkout_denied_before_handoff(canary):
+    conn, tid, policy, save = canary
+    checkout = Path(policy["task_roles"][tid]["review_phase"]["review_checkout"])
+    (checkout / "untracked.txt").write_text("not committed", encoding="utf-8")
+    writer = kb.claim_task(conn, tid)
+    assert writer is not None
+    assert not kb.request_review(
+        conn, tid, reviewer="astra", metadata={"commit": SHA},
+        expected_run_id=writer.current_run_id)
+    assert kb.get_task(conn, tid).status == "running"
+
+
+def test_f10_non_enrolled_historical_task_retains_old_review_flow(canary):
+    conn, tid, policy, save = canary
+    legacy = kb.create_task(
+        conn, title="legacy compatible", assignee="codex-worker",
+        provider_override="openai-codex", model_override="canary-model")
+    policy["task_owners"][legacy] = policy["owner_home"]
+    assert legacy not in policy["rollout"]["task_ids"]
+    save()
+    writer = kb.claim_task(conn, legacy)
+    assert writer is not None
+    assert kb.request_review(
+        conn, legacy, reviewer="astra", metadata={"commit": "f" * 40},
+        summary="historical compatibility", expected_run_id=writer.current_run_id)
+    assert kb.get_task(conn, legacy).status == "review"

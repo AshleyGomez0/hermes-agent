@@ -214,6 +214,23 @@ def test_writer_probe_closes_after_valid_cross_provider_review_handoff(board, mo
         board, title="cross-provider writer completion", assignee="codex-worker",
         provider_override=provider, model_override=model,
     )
+    import subprocess
+    checkout = Path(owner) / "writer-checkout"
+    checkout.mkdir()
+    (checkout / "proof.txt").write_text("committed", encoding="utf-8")
+    def git(*args):
+        return subprocess.run(
+            ["git", "-C", str(checkout), *args],
+            capture_output=True, text=True, check=True, timeout=10,
+        ).stdout.strip()
+    git("init", "-q")
+    git("add", "proof.txt")
+    git("-c", "user.name=CP47 Fixture", "-c", "user.email=test@example.invalid",
+        "commit", "-qm", "real writer commit")
+    exact_sha = git("rev-parse", "HEAD")
+    with kb.write_txn(board):
+        board.execute("UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
+                      (str(checkout.resolve()), tid))
     db = next(row[2] for row in board.execute("PRAGMA database_list") if row[1] == "main")
     policy = {
         "schema_version": 1, "enabled": True,
@@ -232,6 +249,7 @@ def test_writer_probe_closes_after_valid_cross_provider_review_handoff(board, mo
         "task_roles": {tid: {"role": "writer", "review_phase": {
             "role": "independent_reviewer", "writer_task_id": "self",
             "sha_source": "writer_handoff",
+            "review_checkout": str(checkout.resolve()),
         }}},
         "rollout": {"mode": "task_allowlist", "task_ids": [tid]},
     }
@@ -255,7 +273,7 @@ def test_writer_probe_closes_after_valid_cross_provider_review_handoff(board, mo
     with kb.write_txn(board):
         kb._append_event(board, tid, "factory_capacity_permit", scope, run_id=run_id)
     assert kb.request_review(
-        board, tid, reviewer="astra", metadata={"commit": "a" * 40},
+        board, tid, reviewer="astra", metadata={"commit": exact_sha},
         expected_run_id=run_id,
     )
     with kb.write_txn(board):

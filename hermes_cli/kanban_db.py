@@ -3303,7 +3303,7 @@ def request_review(
                 implementer = trow["assignee"]
             from hermes_cli.kanban_factory_transitions import review_routes
             try:
-                factory_routes = review_routes(conn, task_id, implementer, reviewer)
+                factory_routes = review_routes(conn, task_id, implementer, reviewer, run_id=expected_run_id, metadata=metadata)
             except (ValueError, OSError, sqlite3.Error):
                 return _ret(False, "invalid Factory writer/reviewer route")
             assignee_sql = ", assignee = ?" if reviewer is not None else ""

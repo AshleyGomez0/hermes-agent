@@ -119,13 +119,25 @@ def _is_task_enrolled(policy, task_id):
     return task_id in task_ids
 
 
-def _review_handoff_sha(conn, task_id, reviewer):
-    """One SQLite snapshot binds the latest writer run, event and assignee."""
+def _review_handoff_sha(conn, task_id, reviewer, policy=None):
+    """Bind an ended writer run to a real owner-approved exact Git HEAD.
+
+    Called during the review-claim transaction; final completion rechecks.
+    """
+    from hermes_cli.kanban_factory_git_provenance import checkout_commit_matches
+
+    if policy is None:
+        loaded = _load_policy()
+        if loaded is None:
+            return None
+        policy, _ = loaded
+        _validate_owner_and_board(conn, policy)
     row = conn.execute(
-        "WITH latest AS (SELECT id, profile, metadata FROM task_runs "
+        "WITH latest AS (SELECT id, profile, metadata, ended_at FROM task_runs "
         "WHERE task_id=? AND outcome='review_requested' "
         "ORDER BY id DESC LIMIT 1) "
-        "SELECT latest.profile, latest.metadata, "
+        "SELECT latest.id AS writer_run_id, latest.profile, latest.metadata, "
+        "latest.ended_at, "
         "(SELECT payload FROM task_events WHERE task_id=? "
         "AND kind='review_requested' AND run_id=latest.id "
         "ORDER BY id DESC LIMIT 1) AS payload "
@@ -133,9 +145,14 @@ def _review_handoff_sha(conn, task_id, reviewer):
         "WHERE tasks.status='review' AND tasks.assignee=?",
         (task_id, task_id, task_id, reviewer),
     ).fetchone()
-    if (row is None or not row["payload"]
+    if (row is None or not row["payload"] or row["ended_at"] is None
             or not isinstance(row["profile"], str)
             or not row["profile"].strip() or row["profile"] == reviewer):
+        return None
+    if conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id=? AND run_id=? "
+        "AND kind='claimed' LIMIT 1", (task_id, row["writer_run_id"]),
+    ).fetchone() is None:
         return None
     try:
         provenance = json.loads(row["payload"])
@@ -148,9 +165,11 @@ def _review_handoff_sha(conn, task_id, reviewer):
             or provenance.get("reviewer") != reviewer):
         return None
     sha = metadata.get("commit")
-    return sha.lower() if isinstance(sha, str) and re.fullmatch(
-        r"[0-9a-fA-F]{40}", sha,
-    ) else None
+    phase = policy.get("task_roles", {}).get(task_id, {}).get("review_phase")
+    if not isinstance(sha, str) or not checkout_commit_matches(
+            conn, task_id, sha.lower(), phase, policy):
+        return None
+    return sha.lower()
 
 
 def _verified_external_writer(conn, writer, sha, reviewer, contract):
@@ -188,14 +207,14 @@ def _verified_external_writer(conn, writer, sha, reviewer, contract):
         return False
 
 
-def _review_sha(conn, task_id, contract, reviewer):
+def _review_sha(conn, task_id, contract, reviewer, policy=None):
     """Validate explicit external review or verified same-card writer handoff."""
     writer = contract.get("writer_task_id")
     if writer == "self":
         if (contract.get("sha_source") != "writer_handoff"
                 or "reviewed_sha" in contract):
             return None
-        return _review_handoff_sha(conn, task_id, reviewer)
+        return _review_handoff_sha(conn, task_id, reviewer, policy=policy)
     sha = contract.get("reviewed_sha")
     if (not isinstance(writer, str) or not writer.strip()
             or writer == task_id or contract.get("sha_source") is not None
@@ -236,7 +255,7 @@ def _task_contract(conn, task_id, policy, eligible, owner, board_db, path, conte
         return "factory_invalid_review_contract"
     sha = None
     if role == "independent_reviewer":
-        sha = _review_sha(conn, task_id, contract, row["assignee"])
+        sha = _review_sha(conn, task_id, contract, row["assignee"], policy=policy)
         if sha is None:
             return "factory_invalid_review_contract"
     route = next((

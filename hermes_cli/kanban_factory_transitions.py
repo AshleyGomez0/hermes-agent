@@ -7,7 +7,8 @@ write transaction; no task metadata is changed by this helper.
 from hermes_cli import kanban_factory_policy as policy
 
 
-def review_routes(conn, task_id, implementer, reviewer, *, returning=False, origin=None):
+def review_routes(conn, task_id, implementer, reviewer, *, returning=False, origin=None,
+                  run_id=None, metadata=None):
     loaded = policy._load_policy()
     if loaded is None:
         return None
@@ -56,6 +57,17 @@ def review_routes(conn, task_id, implementer, reviewer, *, returning=False, orig
         }
     ):
         raise ValueError("review handoff lacks original writer route provenance")
+    if not returning:
+        # The writer is still claimed inside this BEGIN IMMEDIATE transaction.
+        # Validate source BEFORE swapping the assignee and before ending its run.
+        from hermes_cli.kanban_factory_git_provenance import (
+            active_writer_run_matches, checkout_commit_matches,
+        )
+        sha = metadata.get("commit") if isinstance(metadata, dict) else None
+        if (not active_writer_run_matches(conn, task_id, run_id, implementer)
+                or not isinstance(sha, str)
+                or not checkout_commit_matches(conn, task_id, sha.lower(), phase, document)):
+            raise ValueError("writer run has no verified owner-scoped Git commit")
     return {"writer": (writer["provider"], writer["model"]),
             "reviewer": (review["provider"], review["model"])}
 

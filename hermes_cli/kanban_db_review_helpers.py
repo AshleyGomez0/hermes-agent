@@ -98,7 +98,13 @@ def completion_allowed(conn, task_id, expected_run_id, metadata):
              (row["provider_override"], row["model_override"]) == (route["provider"], route["model"])),
             None,
         )
-        return expected is not None
+        if expected is None:
+            return False
+        # Recheck the exact owner-approved checkout AT the terminal SQLite
+        # gate. A writer cannot move HEAD after reviewer admission and still
+        # have a stale review close this card as DONE.
+        from hermes_cli.kanban_factory_git_provenance import checkout_commit_matches
+        return checkout_commit_matches(conn, task_id, sha.lower(), phase, cfg)
     except (ValueError, TypeError, OSError, KeyError):
         return False
 
