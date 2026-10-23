@@ -1591,8 +1591,13 @@ def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
     monkeypatch.setattr(kbd, "_safe_which_no_cwd", lambda name: "/tmp/planted/hermes")
     assert kbd._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
 
-    monkeypatch.setenv("HERMES_BIN", "/opt/hermes/bin/hermes")
-    assert kbd._resolve_hermes_argv() == ["/opt/hermes/bin/hermes"]
+    explicit_bin = (
+        r"C:\opt\hermes\bin\hermes.exe"
+        if os.name == "nt"
+        else "/opt/hermes/bin/hermes"
+    )
+    monkeypatch.setenv("HERMES_BIN", explicit_bin)
+    assert kbd._resolve_hermes_argv() == [explicit_bin]
 
 
 
